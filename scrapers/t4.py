@@ -42,7 +42,8 @@ class T4Scraper(BaseScraper):
     def __init__(self, playwright_page: Any, config: dict) -> None:
         super().__init__(playwright_page, config)
         self.base_url: str = config.get("url") or os.environ.get("T4_URL", "")
-        self.username: str = config.get("user") or os.environ.get("T4_USER", "")
+        # T4_USER guarda el CUIT/CUIL del operador (no un username clásico).
+        self.cuit: str = config.get("user") or os.environ.get("T4_USER", "")
         self.password: str = config.get("pass") or os.environ.get("T4_PASS", "")
         logger.debug(f"[{self.terminal_name}][INIT] base_url={self.base_url}")
 
@@ -102,8 +103,11 @@ class T4Scraper(BaseScraper):
         if not self.base_url:
             logger.error(f"[{self.terminal_name}][LOGIN] T4_URL no configurado")
             return False
-        if not self.username or not self.password:
-            logger.error(f"[{self.terminal_name}][LOGIN] faltan credenciales (T4_USER/T4_PASS)")
+        if not self.cuit or not self.password:
+            logger.error(
+                f"[{self.terminal_name}][LOGIN] faltan credenciales "
+                f"(T4_USER=CUIT/CUIL y T4_PASS)"
+            )
             return False
 
         try:
@@ -113,29 +117,35 @@ class T4Scraper(BaseScraper):
             )
             await self._wait_networkidle()
 
-            # Input de usuario. Atributos típicos: name=username, id=user, etc.
-            # Fallback a get_by_label si los attrs cambian con minificación Angular.
-            user_input = self.page.locator(
-                "input[name='username'], input[name='user'], input[id*='user' i]"
-            ).first
-            if await user_input.count() == 0:
-                user_input = self.page.get_by_label(re.compile("usuario", re.I)).first
-            await user_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-            await user_input.fill(self.username)
-            logger.debug(f"[{self.terminal_name}][LOGIN] usuario completado")
+            # Campo CUIT/CUIL — el portal lo identifica por su placeholder "CUIT/CUIL".
+            # Fallback a atributos comunes si el placeholder estuviese minificado.
+            cuit_input = self.page.get_by_placeholder(re.compile(r"CUIT", re.I)).first
+            if await cuit_input.count() == 0:
+                cuit_input = self.page.locator(
+                    "input[placeholder*='CUIT' i], "
+                    "input[name*='cuit' i], "
+                    "input[id*='cuit' i]"
+                ).first
+            await cuit_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+            await cuit_input.fill(self.cuit)
+            logger.debug(f"[{self.terminal_name}][LOGIN] CUIT/CUIL completado")
 
-            # Input password — único type=password en pantallas de login.
-            pass_input = self.page.locator("input[type='password']").first
+            # Campo CONTRASEÑA — preferimos placeholder, fallback al único type=password.
+            pass_input = self.page.get_by_placeholder(re.compile(r"contrase", re.I)).first
+            if await pass_input.count() == 0:
+                pass_input = self.page.locator("input[type='password']").first
             await pass_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
             await pass_input.fill(self.password)
             logger.debug(f"[{self.terminal_name}][LOGIN] contraseña completada")
 
-            # Botón submit. Texto típico en español: "Ingresar", "Iniciar sesión", "Login".
-            submit = self.page.get_by_role(
-                "button", name=re.compile(r"ingresar|iniciar|login|entrar", re.I)
-            ).first
+            # Botón "Ingresar". Texto exacto según el portal.
+            submit = self.page.get_by_role("button", name="Ingresar", exact=True).first
             if await submit.count() == 0:
-                submit = self.page.locator("button[type='submit'], input[type='submit']").first
+                submit = self.page.get_by_text("Ingresar", exact=True).first
+            if await submit.count() == 0:
+                submit = self.page.locator(
+                    "button[type='submit'], input[type='submit']"
+                ).first
             await submit.click()
             logger.info(f"[{self.terminal_name}][LOGIN] formulario enviado")
 
