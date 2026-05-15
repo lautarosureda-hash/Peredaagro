@@ -17,8 +17,16 @@ COORDINATION_URL = (
 )
 DEFAULT_TIMEOUT_MS = 15000
 
-# Patrón ISO 6346 para IDs de contenedor: 4 letras + 7 dígitos (ej. TCKU1234567).
-CONTAINER_PATTERN = re.compile(r"\b[A-Z]{4}\d{7}\b")
+# Columnas de la grilla de resultados (confirmadas visualmente sobre el portal):
+#   0:Contenedor 1:L.Deuda 2:Categoría 3:Tipo 4:Línea 5:Estado 6:EIR
+#   7:Documento  8:POL     9:POD       10:Nave 11:Viaje 12:Cutoff 13:Turno
+#   14:Precintos 15:Servicios 16:Coordinar (botón con ícono calendario)
+COL_CONTENEDOR = 0
+COL_DOCUMENTO = 7
+COL_CUTOFF = 12
+COL_TURNO = 13
+MIN_CELLS_PER_ROW = COL_TURNO + 1  # 14 — filtra placeholder rows / spinners
+
 # Fechas comunes en portales argentinos: DD/MM/YYYY o YYYY-MM-DD.
 DATE_PATTERN = re.compile(r"\b(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})\b")
 # Franja horaria: "08:00-12:00", "08:00 - 12:00", "08:00 a 12:00".
@@ -228,32 +236,34 @@ class T4Scraper(BaseScraper):
             if not await self._submit_booking(ctx, booking):
                 return []
 
-            # Paso 5: detectar contenedores de los resultados.
-            containers = await self._find_containers(ctx, booking)
-            if not containers:
+            # Paso 5: leer filas de la tabla (contenedor + metadata).
+            rows = await self._find_containers(ctx, booking)
+            if not rows:
                 logger.warning(
-                    f"[{self.terminal_name}][SCRAPE] sin contenedores para booking {booking}"
+                    f"[{self.terminal_name}][SCRAPE] sin filas para booking {booking}"
                 )
                 return []
 
             logger.info(
-                f"[{self.terminal_name}][SCRAPE] {len(containers)} contenedor(es): {containers}"
+                f"[{self.terminal_name}][SCRAPE] {len(rows)} fila(s): "
+                f"{[r['contenedor'] for r in rows]}"
             )
 
-            # Paso 6+7: para cada contenedor, abrir pantalla de turnos y extraer.
-            for idx, container in enumerate(containers):
-                slots = await self._scrape_container_slots(ctx, container)
+            # Paso 6+7: por cada fila, clickear su botón Coordinar y scrapear turnos.
+            for idx, entry in enumerate(rows):
+                slots = await self._get_slots_for_container(entry["row_index"])
                 results.extend(slots)
 
-                # Si quedan contenedores por procesar, volver a la grilla de resultados.
-                if idx < len(containers) - 1:
+                # Antes del próximo row_index: volver a la grilla de resultados.
+                # El click en Coordinar puede haber abierto un modal o navegado;
+                # re-hacer la búsqueda garantiza un estado consistente.
+                if idx < len(rows) - 1:
                     if not await self._return_to_results(ctx, booking):
                         logger.warning(
                             f"[{self.terminal_name}][SCRAPE] no pude volver a resultados; "
                             f"detengo iteración"
                         )
                         break
-                    # Refrescar el contexto por si el frame se rehidrató.
                     ctx = await self._active_context()
 
             return results
@@ -362,70 +372,125 @@ class T4Scraper(BaseScraper):
         await self._wait_networkidle()
         return True
 
-    async def _find_containers(self, ctx: Page | Frame, booking: str) -> list[str]:
-        """Extrae IDs de contenedor de la tabla de resultados.
+    async def _find_containers(self, ctx: Page | Frame, booking: str) -> list[dict]:
+        """Extrae info por fila de la tabla de resultados.
 
-        - Espera a que la tabla renderice (incluso si está vacía, va a haber tbody).
-        - Detecta el mensaje 'No hay registros a mostrar' → retorna [].
-        - En caso normal, busca IDs ISO 6346 en el texto visible.
+        Tras BUSCAR, Knockout re-renderiza la tabla async. Esperamos a que
+        aparezca al menos una fila REAL (sin el placeholder 'No hay registros')
+        antes de leer. Si timeout-ea, el booking no tiene resultados.
+
+        Retorna list[dict] con:
+            {"row_index": int, "contenedor": str, "documento": str,
+             "cutoff": str, "turno": str}
+        El `row_index` se consume después en `_get_slots_for_container`.
         """
         try:
             await ctx.wait_for_selector(
-                "table tbody tr, [role='row'], .container-row, [class*='resultado' i]",
+                "table tbody tr:not(:has-text('No hay registros'))",
+                timeout=DEFAULT_TIMEOUT_MS,
+            )
+            logger.info(f"[{self.terminal_name}][SCRAPE] tabla cargo con resultados")
+        except PlaywrightTimeoutError:
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] tabla vacia: sin filas reales para "
+                f"booking {booking} (timeout esperando fila != 'No hay registros')"
+            )
+            return []
+
+        rows_loc = ctx.locator("table tbody tr")
+        try:
+            row_count = await rows_loc.count()
+        except Exception as exc:
+            logger.error(f"[{self.terminal_name}][SCRAPE] no pude contar filas: {exc}")
+            return []
+
+        items: list[dict] = []
+        for i in range(row_count):
+            try:
+                cells = rows_loc.nth(i).locator("td")
+                cell_count = await cells.count()
+                # Filas con pocas celdas son placeholders/spinners/empty-state.
+                if cell_count < MIN_CELLS_PER_ROW:
+                    continue
+                contenedor = (await cells.nth(COL_CONTENEDOR).inner_text()).strip()
+                if not contenedor:
+                    continue
+                items.append(
+                    {
+                        "row_index": i,
+                        "contenedor": contenedor,
+                        "documento": (await cells.nth(COL_DOCUMENTO).inner_text()).strip(),
+                        "cutoff": (await cells.nth(COL_CUTOFF).inner_text()).strip(),
+                        "turno": (await cells.nth(COL_TURNO).inner_text()).strip(),
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[{self.terminal_name}][SCRAPE] error leyendo fila {i}: {exc}"
+                )
+                continue
+
+        logger.info(
+            f"[{self.terminal_name}][SCRAPE] {len(items)} fila(s) extraída(s) de la tabla"
+        )
+        return items
+
+    async def _get_slots_for_container(self, row_index: int) -> list[dict]:
+        """Clickea el ícono Coordinar (última columna) de la fila row_index
+        y scrapea los turnos disponibles que se abren.
+
+        SOLO lee — nunca clickea botones de confirmar/reservar. El caller
+        debe llamar `_return_to_results` antes del próximo row_index.
+        """
+        ctx = await self._active_context()
+
+        # nth-child es 1-indexed en CSS; row_index es 0-indexed.
+        row_selector = f"table tbody tr:nth-child({row_index + 1})"
+
+        # Leer el contenedor antes del click (para incluirlo en cada slot).
+        container = ""
+        try:
+            container = (
+                await ctx.locator(f"{row_selector} td:nth-child({COL_CONTENEDOR + 1})")
+                .first.inner_text()
+            ).strip()
+        except Exception:
+            pass
+
+        # Click en el botón/link de la columna Coordinar (última columna).
+        coordinar_selector = f"{row_selector} td:last-child button, {row_selector} td:last-child a"
+        try:
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] clickeando Coordinar de fila {row_index} "
+                f"(contenedor {container})"
+            )
+            await ctx.click(coordinar_selector, timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] no se pudo clickear Coordinar de fila {row_index}"
+            )
+            await self._screenshot(f"coordinar_click_failed_row_{row_index}")
+            return []
+
+        await self._wait_networkidle()
+
+        # Esperar la pantalla/modal de turnos.
+        try:
+            await ctx.wait_for_selector(
+                "[role='dialog'], [class*='modal' i], [class*='slot' i], "
+                "[class*='turno' i], [class*='franja' i], "
+                "table tbody tr:not(:has-text('No hay'))",
                 timeout=DEFAULT_TIMEOUT_MS,
             )
         except PlaywrightTimeoutError:
-            logger.error(f"[{self.terminal_name}][SCRAPE] no aparece grilla de resultados")
-            await self._screenshot(f"no_results_grid_{booking}")
-            return []
-
-        try:
-            body_text = await ctx.locator("body").inner_text()
-        except Exception as exc:
-            logger.error(f"[{self.terminal_name}][SCRAPE] no pude leer texto del body: {exc}")
-            return []
-
-        # Empty state explícito del portal.
-        if re.search(r"no hay registros", body_text, re.I):
-            logger.info(
-                f"[{self.terminal_name}][SCRAPE] tabla vacía: 'No hay registros a mostrar' "
-                f"para booking {booking}"
+            logger.warning(
+                f"[{self.terminal_name}][SCRAPE] no aparece pantalla de turnos para "
+                f"fila {row_index} (contenedor {container})"
             )
+            await self._screenshot(f"slots_screen_not_found_row_{row_index}")
             return []
 
-        return sorted(set(CONTAINER_PATTERN.findall(body_text)))
-
-    async def _scrape_container_slots(self, ctx: Page | Frame, container: str) -> list[dict]:
-        """Hace click en la fila del contenedor y extrae sus turnos disponibles."""
-        try:
-            # Click en cualquier elemento cuyo texto contenga el ID del contenedor.
-            row = ctx.get_by_text(container, exact=False).first
-            await row.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-            await row.click()
-            logger.info(f"[{self.terminal_name}][SCRAPE] click en contenedor {container}")
-            await self._wait_networkidle()
-
-            # Esperar pantalla de turnos. Heurística amplia: tabla/grid/clases
-            # con 'slot' o 'turno' o 'franja' en el nombre.
-            await ctx.wait_for_selector(
-                "table tbody tr, [role='grid'] [role='row'], "
-                "[class*='slot' i], [class*='turno' i], [class*='franja' i]",
-                timeout=DEFAULT_TIMEOUT_MS,
-            )
-        except PlaywrightTimeoutError as exc:
-            logger.error(
-                f"[{self.terminal_name}][SCRAPE] timeout en pantalla de turnos "
-                f"para {container}: {exc}"
-            )
-            await self._screenshot(f"slots_timeout_{container}")
-            return []
-        except Exception as exc:
-            logger.exception(
-                f"[{self.terminal_name}][SCRAPE] error abriendo turnos de {container}: {exc}"
-            )
-            await self._screenshot(f"slots_error_{container}")
-            return []
-
+        # SOLO LEER. _extract_slot_rows nunca clickea — solo extrae texto.
         return await self._extract_slot_rows(ctx, container)
 
     async def _extract_slot_rows(self, ctx: Page | Frame, container: str) -> list[dict]:
