@@ -275,11 +275,14 @@ class T4Scraper(BaseScraper):
     async def _select_exportacion(self, ctx: Page | Frame) -> bool:
         """Selecciona 'EXPORTACIÓN' en el <select id=cbSearchCategory>.
 
-        El dropdown ES un <select> HTML nativo con id/name 'cbSearchCategory'
-        (aunque visualmente parezca custom). Tras la selección, el form
-        renderiza dinámicamente el div #divSearchKeyParameter con el input
-        de Booking — ese div es lo que consume `_submit_booking`.
+        El select usa Knockout.js (data-bind="options:..."): la API
+        `select_option` de Playwright no dispara el evento 'change' que
+        Knockout escucha para reconfigurar el form. Por eso seteamos el
+        value vía JS y emitimos manualmente un evento 'change' con bubbles,
+        lo que sí gatilla el handler de Knockout y hace que aparezca
+        #divSearchKeyParameter con el input de Booking.
         """
+        # 1. Esperar a que el <select> esté en el DOM.
         try:
             await ctx.wait_for_selector("#cbSearchCategory", timeout=DEFAULT_TIMEOUT_MS)
         except PlaywrightTimeoutError:
@@ -289,57 +292,71 @@ class T4Scraper(BaseScraper):
             await self._screenshot("cbSearchCategory_not_found")
             return False
 
+        # 2. Setear el value de EXPORTACIÓN y dispatch 'change' para Knockout.
         try:
-            await ctx.select_option("#cbSearchCategory", label="EXPORTACIÓN")
-            logger.info(
-                f"[{self.terminal_name}][SCRAPE] EXPORTACIÓN seleccionada en #cbSearchCategory"
+            await ctx.evaluate(
+                """() => {
+                    const sel = document.querySelector('#cbSearchCategory');
+                    const opt = Array.from(sel.options).find(o => o.text.trim() === 'EXPORTACIÓN');
+                    if (opt) {
+                        sel.value = opt.value;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }"""
             )
-            await self._wait_networkidle()
-            return True
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] EXPORTACIÓN seleccionada via JS + change event"
+            )
         except Exception as exc:
             logger.error(
-                f"[{self.terminal_name}][SCRAPE] no se pudo seleccionar EXPORTACIÓN "
-                f"en #cbSearchCategory: {exc}"
+                f"[{self.terminal_name}][SCRAPE] error ejecutando JS dispatchEvent en "
+                f"#cbSearchCategory: {exc}"
             )
-            await self._screenshot("cbSearchCategory_select_failed")
+            await self._screenshot("cbSearchCategory_dispatchEvent_failed")
+            return False
+
+        # 3-4. Esperar que Knockout re-renderice el div con el campo Booking.
+        try:
+            await ctx.wait_for_function(
+                "document.querySelector('#divSearchKeyParameter') && "
+                "!document.querySelector('#divSearchKeyParameter').style.display.includes('none')",
+                timeout=10000,
+            )
+            return True
+        except PlaywrightTimeoutError:
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] #divSearchKeyParameter no se hizo visible "
+                f"tras seleccionar EXPORTACIÓN — Knockout no reaccionó o la opción no existía"
+            )
+            await self._screenshot("divSearchKeyParameter_not_visible")
             return False
 
     async def _submit_booking(self, ctx: Page | Frame, booking: str) -> bool:
-        """Completa el campo 'Booking (*)' y clickea el botón BUSCAR."""
-        # Campo Booking — vive dentro de #divSearchKeyParameter, un div que el
-        # form renderiza dinámicamente recién al elegir EXPORTACIÓN en Categoría.
-        # Fallback al label "Booking" por si el id cambiase.
-        booking_input = ctx.locator("#divSearchKeyParameter input").first
-        if await booking_input.count() == 0:
-            booking_input = ctx.get_by_label(re.compile(r"booking", re.I)).first
+        """Completa el campo Booking y clickea el botón BUSCAR.
 
+        Asume que `_select_exportacion` ya hizo visible #divSearchKeyParameter.
+        """
         try:
-            await booking_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-            logger.info(
-                f"[{self.terminal_name}][SCRAPE] campo Booking (*) visible — ingresando {booking}"
+            await ctx.fill(
+                "#divSearchKeyParameter input", booking, timeout=DEFAULT_TIMEOUT_MS
             )
-            await booking_input.fill(booking)
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] booking {booking} ingresado en "
+                f"#divSearchKeyParameter input"
+            )
         except PlaywrightTimeoutError:
-            logger.error(f"[{self.terminal_name}][SCRAPE] no aparece input de Booking")
-            await self._screenshot("booking_input_not_found")
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] no se pudo completar #divSearchKeyParameter input"
+            )
+            await self._screenshot("booking_fill_failed")
             return False
 
-        # Botón BUSCAR (texto exacto en mayúsculas, color naranja en el portal).
-        search_btn = ctx.get_by_role(
-            "button", name=re.compile(r"^\s*BUSCAR\s*$", re.I)
-        ).first
-        if await search_btn.count() == 0:
-            search_btn = ctx.get_by_text(re.compile(r"^\s*BUSCAR\s*$", re.I)).first
-        if await search_btn.count() == 0:
-            search_btn = ctx.locator("button[type='submit'], input[type='submit']").first
-
         try:
-            await search_btn.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
             logger.info(f"[{self.terminal_name}][SCRAPE] clicking BUSCAR")
-            await search_btn.click()
+            await ctx.click("button:has-text('BUSCAR')", timeout=DEFAULT_TIMEOUT_MS)
         except PlaywrightTimeoutError:
-            logger.error(f"[{self.terminal_name}][SCRAPE] no aparece botón BUSCAR")
-            await self._screenshot("buscar_button_not_found")
+            logger.error(f"[{self.terminal_name}][SCRAPE] no se pudo clickear BUSCAR")
+            await self._screenshot("buscar_click_failed")
             return False
 
         await self._wait_networkidle()
