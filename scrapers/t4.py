@@ -220,11 +220,11 @@ class T4Scraper(BaseScraper):
 
             ctx = await self._active_context()
 
-            # Paso 3: seleccionar "Exportación". Puede ser tab, botón o item de menú.
-            if not await self._click_exportacion(ctx):
+            # Paso 3: seleccionar EXPORTACIÓN en el dropdown Categoría.
+            if not await self._select_exportacion(ctx):
                 return []
 
-            # Paso 4: ingresar booking y disparar búsqueda.
+            # Paso 4 + 5: ingresar booking y clickear BUSCAR.
             if not await self._submit_booking(ctx, booking):
                 return []
 
@@ -272,64 +272,96 @@ class T4Scraper(BaseScraper):
 
     # ---- Sub-pasos -------------------------------------------------------
 
-    async def _click_exportacion(self, ctx: Page | Frame) -> bool:
-        """Selecciona la opción 'Exportación' en la pantalla de coordination."""
-        # Tab "Exportación" — primera prioridad si la UI usa tabs.
-        loc = ctx.get_by_role("tab", name=re.compile("exportaci", re.I))
-        if await loc.count() == 0:
-            # Botón "Exportación"
-            loc = ctx.get_by_role("button", name=re.compile("exportaci", re.I))
-        if await loc.count() == 0:
-            # Item de menú o cualquier elemento clickeable con ese texto
-            loc = ctx.get_by_text(re.compile(r"exportaci", re.I)).first
+    async def _select_exportacion(self, ctx: Page | Frame) -> bool:
+        """Selecciona 'EXPORTACIÓN' en el dropdown 'Categoría (*)'.
+
+        El campo es un <select> nativo. Lo ubicamos primero por su label
+        ('Categoría'); si el binding label/control no está bien marcado en HTML,
+        caemos al primer <select> visible (la Categoría es el primero del form
+        según la estructura del portal).
+        """
+        # Esperar a que el form de búsqueda esté renderizado.
+        try:
+            await ctx.wait_for_selector("select", timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            logger.error(f"[{self.terminal_name}][SCRAPE] no aparece el form de búsqueda (ningún <select>)")
+            await self._screenshot("form_no_select")
+            return False
+
+        # Primer intento: get_by_label matchea Categoría / Categoría (*) etc.
+        category_select = ctx.get_by_label(re.compile(r"categor", re.I)).first
+        if await category_select.count() == 0:
+            # Fallback: primer <select> del form (Categoría es el primer dropdown).
+            category_select = ctx.locator("select").first
 
         try:
-            await loc.first.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-            await loc.first.click()
-            logger.info(f"[{self.terminal_name}][SCRAPE] 'Exportación' seleccionado")
+            await category_select.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] seleccionando EXPORTACIÓN en dropdown Categoría"
+            )
+            await category_select.select_option(label="EXPORTACIÓN")
             await self._wait_networkidle()
             return True
         except PlaywrightTimeoutError:
-            logger.error(f"[{self.terminal_name}][SCRAPE] no aparece selector 'Exportación'")
-            await self._screenshot("exportacion_not_found")
+            logger.error(f"[{self.terminal_name}][SCRAPE] dropdown Categoría no visible")
+            await self._screenshot("categoria_select_not_visible")
+            return False
+        except Exception as exc:
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] no se pudo seleccionar EXPORTACIÓN: {exc}"
+            )
+            await self._screenshot("categoria_select_option_failed")
             return False
 
     async def _submit_booking(self, ctx: Page | Frame, booking: str) -> bool:
-        """Completa el campo de booking y dispara la búsqueda."""
-        # Input booking — preferir label visible. Fallback a name/id/placeholder.
-        loc = ctx.get_by_label(re.compile("booking", re.I)).first
-        if await loc.count() == 0:
-            loc = ctx.locator(
+        """Completa el campo 'Booking (*)' y clickea el botón BUSCAR."""
+        # Campo Booking — identificado por su label "Booking (*)".
+        # Fallback a name/id/placeholder por si el label no está asociado.
+        booking_input = ctx.get_by_label(re.compile(r"booking", re.I)).first
+        if await booking_input.count() == 0:
+            booking_input = ctx.locator(
                 "input[name*='booking' i], input[id*='booking' i], "
                 "input[placeholder*='booking' i]"
             ).first
 
         try:
-            await loc.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-            await loc.fill(booking)
-            logger.debug(f"[{self.terminal_name}][SCRAPE] booking '{booking}' tipeado")
+            await booking_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] ingresando booking {booking} en campo Booking"
+            )
+            await booking_input.fill(booking)
         except PlaywrightTimeoutError:
-            logger.error(f"[{self.terminal_name}][SCRAPE] no aparece input de booking")
+            logger.error(f"[{self.terminal_name}][SCRAPE] no aparece input de Booking")
             await self._screenshot("booking_input_not_found")
             return False
 
-        # Disparar búsqueda: primero intentamos botón explícito, sino Enter.
-        search_btn = ctx.get_by_role("button", name=re.compile(r"buscar|consultar", re.I))
-        if await search_btn.count() > 0:
-            await search_btn.first.click()
-            logger.debug(f"[{self.terminal_name}][SCRAPE] botón Buscar clickeado")
-        else:
-            await loc.press("Enter")
-            logger.debug(f"[{self.terminal_name}][SCRAPE] Enter en input de booking")
+        # Botón BUSCAR (texto exacto en mayúsculas, color naranja en el portal).
+        search_btn = ctx.get_by_role(
+            "button", name=re.compile(r"^\s*BUSCAR\s*$", re.I)
+        ).first
+        if await search_btn.count() == 0:
+            search_btn = ctx.get_by_text(re.compile(r"^\s*BUSCAR\s*$", re.I)).first
+        if await search_btn.count() == 0:
+            search_btn = ctx.locator("button[type='submit'], input[type='submit']").first
+
+        try:
+            await search_btn.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+            logger.info(f"[{self.terminal_name}][SCRAPE] clicking BUSCAR")
+            await search_btn.click()
+        except PlaywrightTimeoutError:
+            logger.error(f"[{self.terminal_name}][SCRAPE] no aparece botón BUSCAR")
+            await self._screenshot("buscar_button_not_found")
+            return False
 
         await self._wait_networkidle()
         return True
 
     async def _find_containers(self, ctx: Page | Frame, booking: str) -> list[str]:
-        """Extrae IDs de contenedor del DOM de resultados.
+        """Extrae IDs de contenedor de la tabla de resultados.
 
-        Espera a que aparezca alguna grilla y luego matchea el patrón ISO 6346
-        contra el texto visible. Si no hay grilla en 15s, retorna [].
+        - Espera a que la tabla renderice (incluso si está vacía, va a haber tbody).
+        - Detecta el mensaje 'No hay registros a mostrar' → retorna [].
+        - En caso normal, busca IDs ISO 6346 en el texto visible.
         """
         try:
             await ctx.wait_for_selector(
@@ -345,6 +377,14 @@ class T4Scraper(BaseScraper):
             body_text = await ctx.locator("body").inner_text()
         except Exception as exc:
             logger.error(f"[{self.terminal_name}][SCRAPE] no pude leer texto del body: {exc}")
+            return []
+
+        # Empty state explícito del portal.
+        if re.search(r"no hay registros", body_text, re.I):
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] tabla vacía: 'No hay registros a mostrar' "
+                f"para booking {booking}"
+            )
             return []
 
         return sorted(set(CONTAINER_PATTERN.findall(body_text)))
@@ -437,7 +477,7 @@ class T4Scraper(BaseScraper):
         if not await self._go_to_coordination():
             return False
         ctx2 = await self._active_context()
-        if not await self._click_exportacion(ctx2):
+        if not await self._select_exportacion(ctx2):
             return False
         if not await self._submit_booking(ctx2, booking):
             return False
