@@ -273,44 +273,57 @@ class T4Scraper(BaseScraper):
     # ---- Sub-pasos -------------------------------------------------------
 
     async def _select_exportacion(self, ctx: Page | Frame) -> bool:
-        """Selecciona 'EXPORTACIÓN' en el dropdown 'Categoría (*)'.
+        """Selecciona 'EXPORTACIÓN' en el dropdown Categoría.
 
-        El campo es un <select> nativo. Lo ubicamos primero por su label
-        ('Categoría'); si el binding label/control no está bien marcado en HTML,
-        caemos al primer <select> visible (la Categoría es el primero del form
-        según la estructura del portal).
+        El campo NO es un <select> nativo: es un dropdown custom que se abre
+        con click y expone las opciones como elementos clickeables. El flujo:
+            1) Click en el trigger (muestra "--" cuando no hay selección y
+               Categoría es el primer dropdown del form con ese placeholder).
+            2) Click en la opción 'EXPORTACIÓN' una vez que el panel se abre.
+            3) Verificar que el form se reconfigura: el campo siguiente cambia
+               de 'Contenedor (*)' a 'Booking (*)'. Usamos esa transición
+               como confirmación.
         """
-        # Esperar a que el form de búsqueda esté renderizado.
+        # 1. Abrir el dropdown clickeando su trigger (texto "--").
         try:
-            await ctx.wait_for_selector("select", timeout=DEFAULT_TIMEOUT_MS)
+            trigger = ctx.get_by_text("--", exact=True).first
+            await trigger.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+            logger.info(f"[{self.terminal_name}][SCRAPE] abriendo dropdown Categoría")
+            await trigger.click()
         except PlaywrightTimeoutError:
-            logger.error(f"[{self.terminal_name}][SCRAPE] no aparece el form de búsqueda (ningún <select>)")
-            await self._screenshot("form_no_select")
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] no aparece trigger '--' del dropdown Categoría"
+            )
+            await self._screenshot("categoria_trigger_not_visible")
             return False
 
-        # Primer intento: get_by_label matchea Categoría / Categoría (*) etc.
-        category_select = ctx.get_by_label(re.compile(r"categor", re.I)).first
-        if await category_select.count() == 0:
-            # Fallback: primer <select> del form (Categoría es el primer dropdown).
-            category_select = ctx.locator("select").first
-
+        # 2. Clickear la opción EXPORTACIÓN. Después del click en el trigger,
+        #    las opciones quedan visibles en el DOM (overlay o panel inline).
         try:
-            await category_select.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-            logger.info(
-                f"[{self.terminal_name}][SCRAPE] seleccionando EXPORTACIÓN en dropdown Categoría"
-            )
-            await category_select.select_option(label="EXPORTACIÓN")
+            option = ctx.get_by_text("EXPORTACIÓN", exact=True).first
+            await option.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+            logger.info(f"[{self.terminal_name}][SCRAPE] seleccionando EXPORTACIÓN")
+            await option.click()
             await self._wait_networkidle()
+        except PlaywrightTimeoutError:
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] no aparece opción EXPORTACIÓN "
+                f"tras abrir el dropdown"
+            )
+            await self._screenshot("exportacion_option_not_visible")
+            return False
+
+        # 3. Verificar que el form se reconfigura: el campo Booking (*) aparece.
+        try:
+            booking_input = ctx.get_by_label(re.compile(r"booking", re.I)).first
+            await booking_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
             return True
         except PlaywrightTimeoutError:
-            logger.error(f"[{self.terminal_name}][SCRAPE] dropdown Categoría no visible")
-            await self._screenshot("categoria_select_not_visible")
-            return False
-        except Exception as exc:
             logger.error(
-                f"[{self.terminal_name}][SCRAPE] no se pudo seleccionar EXPORTACIÓN: {exc}"
+                f"[{self.terminal_name}][SCRAPE] no aparece campo 'Booking (*)' "
+                f"tras seleccionar EXPORTACIÓN — el form no se reconfiguró"
             )
-            await self._screenshot("categoria_select_option_failed")
+            await self._screenshot("booking_field_not_visible_after_exportacion")
             return False
 
     async def _submit_booking(self, ctx: Page | Frame, booking: str) -> bool:
@@ -327,7 +340,7 @@ class T4Scraper(BaseScraper):
         try:
             await booking_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
             logger.info(
-                f"[{self.terminal_name}][SCRAPE] ingresando booking {booking} en campo Booking"
+                f"[{self.terminal_name}][SCRAPE] campo Booking (*) visible — ingresando {booking}"
             )
             await booking_input.fill(booking)
         except PlaywrightTimeoutError:
