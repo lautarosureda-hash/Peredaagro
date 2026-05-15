@@ -325,21 +325,43 @@ class T4Scraper(BaseScraper):
             await self._screenshot("cbSearchCategory_dispatchEvent_failed")
             return False
 
-        # 3-4. Esperar que Knockout re-renderice el div con el campo Booking.
+        # 3. Margen fijo para que Knockout procese el 'change' y re-renderice.
+        #    Excepción al "sin sleeps fijos": chequear style.display no captura
+        #    visibilidad gobernada por clases CSS, y el siguiente paso usa varios
+        #    selectores con su propio wait — el sleep solo evita que el primer
+        #    intento corra contra un DOM todavía sin actualizar.
+        await ctx.wait_for_timeout(1000)
+
+        # 4. Probar selectores candidatos del input Booking en orden de
+        #    especificidad. El primero que aparezca dentro de 10s gana.
+        candidate_selectors = [
+            "#divSearchKeyParameter input",
+            "input[placeholder*='booking' i]",
+            "input[placeholder*='BK' i]",
+            "input[name*='booking' i]",
+        ]
+        for selector in candidate_selectors:
+            try:
+                await ctx.wait_for_selector(selector, timeout=10000)
+                logger.info(
+                    f"[{self.terminal_name}][SCRAPE] campo Booking ubicado vía '{selector}'"
+                )
+                return True
+            except PlaywrightTimeoutError:
+                continue
+
+        # 5. Ningún selector apareció. Diagnosticar leyendo el value del select.
         try:
-            await ctx.wait_for_function(
-                "document.querySelector('#divSearchKeyParameter') && "
-                "!document.querySelector('#divSearchKeyParameter').style.display.includes('none')",
-                timeout=10000,
+            val = await ctx.evaluate(
+                "document.querySelector('#cbSearchCategory')?.value"
             )
-            return True
-        except PlaywrightTimeoutError:
-            logger.error(
-                f"[{self.terminal_name}][SCRAPE] #divSearchKeyParameter no se hizo visible "
-                f"tras seleccionar EXPORTACIÓN — Knockout no reaccionó o la opción no existía"
-            )
-            await self._screenshot("divSearchKeyParameter_not_visible")
-            return False
+        except Exception as exc:
+            val = f"<error leyendo value: {exc}>"
+        logger.error(
+            f"[{self.terminal_name}][SCRAPE] valor actual de #cbSearchCategory: {val}"
+        )
+        await self._screenshot("divSearchKeyParameter_all_selectors_failed")
+        return False
 
     async def _submit_booking(self, ctx: Page | Frame, booking: str) -> bool:
         """Completa el campo Booking y clickea el botón BUSCAR.
@@ -389,10 +411,10 @@ class T4Scraper(BaseScraper):
                 "table tbody tr:not(:has-text('No hay registros'))",
                 timeout=DEFAULT_TIMEOUT_MS,
             )
-            logger.info(f"[{self.terminal_name}][SCRAPE] tabla cargo con resultados")
+            logger.info(f"[{self.terminal_name}][SCRAPE] tabla cargó con resultados")
         except PlaywrightTimeoutError:
             logger.info(
-                f"[{self.terminal_name}][SCRAPE] tabla vacia: sin filas reales para "
+                f"[{self.terminal_name}][SCRAPE] tabla vacía: sin filas reales para "
                 f"booking {booking} (timeout esperando fila != 'No hay registros')"
             )
             return []
