@@ -273,69 +273,45 @@ class T4Scraper(BaseScraper):
     # ---- Sub-pasos -------------------------------------------------------
 
     async def _select_exportacion(self, ctx: Page | Frame) -> bool:
-        """Selecciona 'EXPORTACIÓN' en el dropdown Categoría.
+        """Selecciona 'EXPORTACIÓN' en el <select id=cbSearchCategory>.
 
-        El campo NO es un <select> nativo: es un dropdown custom que se abre
-        con click y expone las opciones como elementos clickeables. El flujo:
-            1) Click en el trigger (muestra "--" cuando no hay selección y
-               Categoría es el primer dropdown del form con ese placeholder).
-            2) Click en la opción 'EXPORTACIÓN' una vez que el panel se abre.
-            3) Verificar que el form se reconfigura: el campo siguiente cambia
-               de 'Contenedor (*)' a 'Booking (*)'. Usamos esa transición
-               como confirmación.
+        El dropdown ES un <select> HTML nativo con id/name 'cbSearchCategory'
+        (aunque visualmente parezca custom). Tras la selección, el form
+        renderiza dinámicamente el div #divSearchKeyParameter con el input
+        de Booking — ese div es lo que consume `_submit_booking`.
         """
-        # 1. Abrir el dropdown clickeando su trigger (texto "--").
         try:
-            trigger = ctx.get_by_text("--", exact=True).first
-            await trigger.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-            logger.info(f"[{self.terminal_name}][SCRAPE] abriendo dropdown Categoría")
-            await trigger.click()
+            await ctx.wait_for_selector("#cbSearchCategory", timeout=DEFAULT_TIMEOUT_MS)
         except PlaywrightTimeoutError:
             logger.error(
-                f"[{self.terminal_name}][SCRAPE] no aparece trigger '--' del dropdown Categoría"
+                f"[{self.terminal_name}][SCRAPE] #cbSearchCategory no aparece en el DOM"
             )
-            await self._screenshot("categoria_trigger_not_visible")
+            await self._screenshot("cbSearchCategory_not_found")
             return False
 
-        # 2. Clickear la opción EXPORTACIÓN. Después del click en el trigger,
-        #    las opciones quedan visibles en el DOM (overlay o panel inline).
         try:
-            option = ctx.get_by_text("EXPORTACIÓN", exact=True).first
-            await option.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-            logger.info(f"[{self.terminal_name}][SCRAPE] seleccionando EXPORTACIÓN")
-            await option.click()
+            await ctx.select_option("#cbSearchCategory", label="EXPORTACIÓN")
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] EXPORTACIÓN seleccionada en #cbSearchCategory"
+            )
             await self._wait_networkidle()
-        except PlaywrightTimeoutError:
-            logger.error(
-                f"[{self.terminal_name}][SCRAPE] no aparece opción EXPORTACIÓN "
-                f"tras abrir el dropdown"
-            )
-            await self._screenshot("exportacion_option_not_visible")
-            return False
-
-        # 3. Verificar que el form se reconfigura: el campo Booking (*) aparece.
-        try:
-            booking_input = ctx.get_by_label(re.compile(r"booking", re.I)).first
-            await booking_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
             return True
-        except PlaywrightTimeoutError:
+        except Exception as exc:
             logger.error(
-                f"[{self.terminal_name}][SCRAPE] no aparece campo 'Booking (*)' "
-                f"tras seleccionar EXPORTACIÓN — el form no se reconfiguró"
+                f"[{self.terminal_name}][SCRAPE] no se pudo seleccionar EXPORTACIÓN "
+                f"en #cbSearchCategory: {exc}"
             )
-            await self._screenshot("booking_field_not_visible_after_exportacion")
+            await self._screenshot("cbSearchCategory_select_failed")
             return False
 
     async def _submit_booking(self, ctx: Page | Frame, booking: str) -> bool:
         """Completa el campo 'Booking (*)' y clickea el botón BUSCAR."""
-        # Campo Booking — identificado por su label "Booking (*)".
-        # Fallback a name/id/placeholder por si el label no está asociado.
-        booking_input = ctx.get_by_label(re.compile(r"booking", re.I)).first
+        # Campo Booking — vive dentro de #divSearchKeyParameter, un div que el
+        # form renderiza dinámicamente recién al elegir EXPORTACIÓN en Categoría.
+        # Fallback al label "Booking" por si el id cambiase.
+        booking_input = ctx.locator("#divSearchKeyParameter input").first
         if await booking_input.count() == 0:
-            booking_input = ctx.locator(
-                "input[name*='booking' i], input[id*='booking' i], "
-                "input[placeholder*='booking' i]"
-            ).first
+            booking_input = ctx.get_by_label(re.compile(r"booking", re.I)).first
 
         try:
             await booking_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
