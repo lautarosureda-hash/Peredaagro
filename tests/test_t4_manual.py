@@ -40,7 +40,7 @@ async def main() -> None:
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=False)
-        context = await browser.new_context()
+        context = await browser.new_context(viewport={"width": 1920, "height": 1080})
         page = await context.new_page()
 
         scraper = T4Scraper(page, config={})
@@ -65,9 +65,16 @@ async def main() -> None:
         except Exception as exc:
             logger.error(f"[TEST][T4] no pude guardar screenshot final: {exc}")
 
+        # Mantener el browser abierto para inspeccionar el log y la pantalla.
+        input("Presioná Enter para cerrar el browser...")
+
         await context.close()
         await browser.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.exception(f"[TEST] excepción no capturada: {e}")
+        input("Error — presioná Enter para cerrar...")

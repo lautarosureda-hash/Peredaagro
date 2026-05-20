@@ -17,20 +17,17 @@ COORDINATION_URL = (
 )
 DEFAULT_TIMEOUT_MS = 15000
 
-# Columnas de la grilla de resultados (confirmadas visualmente sobre el portal):
-#   0:Contenedor 1:L.Deuda 2:Categoría 3:Tipo 4:Línea 5:Estado 6:EIR
-#   7:Documento  8:POL     9:POD       10:Nave 11:Viaje 12:Cutoff 13:Turno
-#   14:Precintos 15:Servicios 16:Coordinar (botón con ícono calendario)
-COL_CONTENEDOR = 0
-COL_DOCUMENTO = 7
-COL_CUTOFF = 12
-COL_TURNO = 13
-MIN_CELLS_PER_ROW = COL_TURNO + 1  # 14 — filtra placeholder rows / spinners
-
-# Fechas comunes en portales argentinos: DD/MM/YYYY o YYYY-MM-DD.
-DATE_PATTERN = re.compile(r"\b(\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2})\b")
-# Franja horaria: "08:00-12:00", "08:00 - 12:00", "08:00 a 12:00".
-TIME_RANGE_PATTERN = re.compile(r"\b(\d{2}:\d{2})\s*(?:-|a|A)\s*(\d{2}:\d{2})\b")
+# Columnas de la grilla de resultados (confirmadas sobre el HTML real — 20
+# celdas por fila; la celda 0 es un checkbox vacío):
+#   0:checkbox   1:Contenedor 2:L.Deuda  3:Categoría 4:Tipo   5:Línea
+#   6:Estado     7:EIR        8:Documento 9:POL      10:POD   11:Nave
+#   12:Viaje     13:Cutoff    14:Turno   15:Precintos 16:Servicios
+#   17:Coordinar (botón calendario)  18:Anular Turno  19:(extra)
+COL_CONTENEDOR = 1
+COL_DOCUMENTO = 8
+COL_CUTOFF = 13
+COL_TURNO = 14
+MIN_CELLS_PER_ROW = 18  # filtra placeholder rows / spinners
 
 
 class T4Scraper(BaseScraper):
@@ -249,23 +246,15 @@ class T4Scraper(BaseScraper):
                 f"{[r['contenedor'] for r in rows]}"
             )
 
-            # Paso 6+7: por cada fila, clickear su botón Coordinar y scrapear turnos.
-            for idx, entry in enumerate(rows):
-                slots = await self._get_slots_for_container(entry["row_index"])
-                results.extend(slots)
-
-                # Antes del próximo row_index: volver a la grilla de resultados.
-                # El click en Coordinar puede haber abierto un modal o navegado;
-                # re-hacer la búsqueda garantiza un estado consistente.
-                if idx < len(rows) - 1:
-                    if not await self._return_to_results(ctx, booking):
-                        logger.warning(
-                            f"[{self.terminal_name}][SCRAPE] no pude volver a resultados; "
-                            f"detengo iteración"
-                        )
-                        break
-                    ctx = await self._active_context()
-
+            # Paso 6+7: usar SIEMPRE el primer contenedor de la grilla.
+            # Se clickea el calendario azul de su columna Coordinar y se
+            # scrapean los turnos que se despliegan.
+            first = rows[0]
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] usando primer contenedor "
+                f"{first['contenedor']} (row_index={first['row_index']})"
+            )
+            results = await self._get_slots_for_container(first["row_index"])
             return results
 
         except Exception as exc:
@@ -303,19 +292,37 @@ class T4Scraper(BaseScraper):
             return False
 
         # 2. Setear el value de EXPORTACIÓN y dispatch 'change' para Knockout.
+        #    El match de la opción es tolerante: normaliza acentos y mayúsculas
+        #    y busca por substring 'EXPORT', porque el portal puede rotular la
+        #    opción como 'EXPORTACIÓN', 'EXPORTACION' o 'Exportación'. Un match
+        #    exacto fallaba en silencio y dejaba pasar el booking sin categoría.
         try:
-            await ctx.evaluate(
+            result = await ctx.evaluate(
                 """() => {
                     const sel = document.querySelector('#cbSearchCategory');
-                    const opt = Array.from(sel.options).find(o => o.text.trim() === 'EXPORTACIÓN');
-                    if (opt) {
-                        sel.value = opt.value;
-                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    if (!sel) return { ok: false, reason: 'select-no-encontrado' };
+                    const norm = s => (s || '')
+                        .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')
+                        .trim().toUpperCase();
+                    const opt = Array.from(sel.options)
+                        .find(o => norm(o.text).includes('EXPORT'));
+                    if (!opt) {
+                        return {
+                            ok: false,
+                            reason: 'opcion-export-no-encontrada',
+                            opciones: Array.from(sel.options).map(o => o.text),
+                        };
                     }
+                    sel.value = opt.value;
+                    sel.dispatchEvent(new Event('input', { bubbles: true }));
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    return {
+                        ok: sel.value === opt.value,
+                        reason: sel.value === opt.value ? 'ok' : 'value-no-aplicado',
+                        value: sel.value,
+                        text: opt.text,
+                    };
                 }"""
-            )
-            logger.info(
-                f"[{self.terminal_name}][SCRAPE] EXPORTACIÓN seleccionada via JS + change event"
             )
         except Exception as exc:
             logger.error(
@@ -324,6 +331,22 @@ class T4Scraper(BaseScraper):
             )
             await self._screenshot("cbSearchCategory_dispatchEvent_failed")
             return False
+
+        if not result or not result.get("ok"):
+            reason = result.get("reason") if result else "evaluate-devolvio-null"
+            opciones = result.get("opciones") if result else None
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] no se pudo seleccionar EXPORTACIÓN "
+                f"en #cbSearchCategory (motivo={reason}, opciones={opciones}) — "
+                f"abortando para no pegar el booking sin categoría"
+            )
+            await self._screenshot("cbSearchCategory_exportacion_no_seleccionada")
+            return False
+
+        logger.info(
+            f"[{self.terminal_name}][SCRAPE] EXPORTACIÓN seleccionada via JS + change event "
+            f"(value={result.get('value')}, text={result.get('text')})"
+        )
 
         # 3. Margen fijo para que Knockout procese el 'change' y re-renderice.
         #    Excepción al "sin sleeps fijos": chequear style.display no captura
@@ -391,6 +414,20 @@ class T4Scraper(BaseScraper):
             await self._screenshot("buscar_click_failed")
             return False
 
+        # Esperar a que la grilla renderice su primera fila tras BUSCAR, en
+        # vez de un wait fijo.
+        try:
+            await ctx.wait_for_selector(
+                "table tbody tr", timeout=DEFAULT_TIMEOUT_MS
+            )
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] tabla con filas detectada"
+            )
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"[{self.terminal_name}][SCRAPE] no aparecieron filas en la tabla "
+                f"tras BUSCAR"
+            )
         await self._wait_networkidle()
         return True
 
@@ -426,16 +463,42 @@ class T4Scraper(BaseScraper):
             logger.error(f"[{self.terminal_name}][SCRAPE] no pude contar filas: {exc}")
             return []
 
+        # DEBUG: HTML de la primera fila para ver la estructura real del DOM.
+        try:
+            first_row_html = await ctx.evaluate(
+                "document.querySelector('table tbody tr')?.innerHTML"
+            )
+            logger.debug(
+                f"[{self.terminal_name}][SCRAPE] HTML primera fila: "
+                f"{(first_row_html or '')[:500]}"
+            )
+        except Exception:
+            pass
+
         items: list[dict] = []
         for i in range(row_count):
             try:
                 cells = rows_loc.nth(i).locator("td")
                 cell_count = await cells.count()
+                logger.debug(
+                    f"[{self.terminal_name}][SCRAPE] fila {i}: {cell_count} celdas"
+                )
                 # Filas con pocas celdas son placeholders/spinners/empty-state.
                 if cell_count < MIN_CELLS_PER_ROW:
+                    logger.debug(
+                        f"[{self.terminal_name}][SCRAPE] fila {i} descartada: "
+                        f"{cell_count} < {MIN_CELLS_PER_ROW}"
+                    )
                     continue
                 contenedor = (await cells.nth(COL_CONTENEDOR).inner_text()).strip()
+                logger.debug(
+                    f"[{self.terminal_name}][SCRAPE] fila {i}: contenedor='{contenedor}'"
+                )
                 if not contenedor:
+                    logger.debug(
+                        f"[{self.terminal_name}][SCRAPE] fila {i} descartada: "
+                        f"contenedor vacío"
+                    )
                     continue
                 items.append(
                     {
@@ -458,11 +521,10 @@ class T4Scraper(BaseScraper):
         return items
 
     async def _get_slots_for_container(self, row_index: int) -> list[dict]:
-        """Clickea el ícono Coordinar (última columna) de la fila row_index
-        y scrapea los turnos disponibles que se abren.
+        """Clickea el calendario azul de la columna 'Coordinar' en la fila
+        row_index y scrapea los turnos disponibles que se abren.
 
-        SOLO lee — nunca clickea botones de confirmar/reservar. El caller
-        debe llamar `_return_to_results` antes del próximo row_index.
+        SOLO lee — nunca clickea botones de confirmar/reservar.
         """
         ctx = await self._active_context()
 
@@ -479,99 +541,218 @@ class T4Scraper(BaseScraper):
         except Exception:
             pass
 
-        # Click en el botón/link de la columna Coordinar (última columna).
-        coordinar_selector = f"{row_selector} td:last-child button, {row_selector} td:last-child a"
+        # Antes de clickear: scroll a la fila para que la columna 'Coordinar'
+        # —que puede quedar fuera del viewport— quede visible y clickeable.
         try:
-            logger.info(
-                f"[{self.terminal_name}][SCRAPE] clickeando Coordinar de fila {row_index} "
-                f"(contenedor {container})"
+            await ctx.evaluate(
+                f"""() => {{
+                    const row = document.querySelector(
+                        'table tbody tr:nth-child({row_index + 1})'
+                    );
+                    if (row) row.scrollIntoView({{behavior: 'instant', block: 'center'}});
+                }}"""
             )
-            await ctx.click(coordinar_selector, timeout=DEFAULT_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
-            logger.error(
-                f"[{self.terminal_name}][SCRAPE] no se pudo clickear Coordinar de fila {row_index}"
+            await ctx.wait_for_timeout(300)
+        except Exception as exc:
+            logger.warning(
+                f"[{self.terminal_name}][SCRAPE] no pude hacer scroll a la fila "
+                f"{row_index}: {exc}"
             )
-            await self._screenshot(f"coordinar_click_failed_row_{row_index}")
-            return []
 
-        await self._wait_networkidle()
-
-        # Esperar la pantalla/modal de turnos.
+        # Esperar a que Knockout termine de renderizar los botones Coordinar
+        # antes de clickear. Sin esta espera el click corre contra un DOM
+        # todavía incompleto y el botón de la fila no existe aún.
         try:
             await ctx.wait_for_selector(
-                "[role='dialog'], [class*='modal' i], [class*='slot' i], "
-                "[class*='turno' i], [class*='franja' i], "
-                "table tbody tr:not(:has-text('No hay'))",
+                "button.btn-primary.btn-sm.btn-icon",
+                state="visible",
                 timeout=DEFAULT_TIMEOUT_MS,
             )
         except PlaywrightTimeoutError:
-            logger.warning(
-                f"[{self.terminal_name}][SCRAPE] no aparece pantalla de turnos para "
-                f"fila {row_index} (contenedor {container})"
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] no aparecieron los botones Coordinar "
+                f"en el DOM para fila {row_index}"
             )
-            await self._screenshot(f"slots_screen_not_found_row_{row_index}")
+            await self._screenshot(f"coordinar_buttons_not_found_row_{row_index}")
+            return []
+        logger.info(f"[{self.terminal_name}][SCRAPE] botones Coordinar visibles en DOM")
+
+        # Hay exactamente 1 botón Coordinar por fila, en orden — el índice del
+        # botón coincide con row_index.
+        buttons = ctx.locator("button.btn-primary.btn-sm.btn-icon")
+        count = await buttons.count()
+        logger.info(
+            f"[{self.terminal_name}][SCRAPE] {count} botones Coordinar encontrados"
+        )
+        if row_index >= count:
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] row_index {row_index} fuera de rango "
+                f"({count} botones Coordinar)"
+            )
+            await self._screenshot(f"coordinar_index_out_of_range_row_{row_index}")
             return []
 
-        # SOLO LEER. _extract_slot_rows nunca clickea — solo extrae texto.
-        return await self._extract_slot_rows(ctx, container)
+        target = buttons.nth(row_index)
+        # El binding Knockout 'enable: allowToCreateAppt' deshabilita el botón
+        # cuando no hay turno disponible para ese contenedor.
+        if await target.get_attribute("disabled") is not None:
+            logger.warning(
+                f"[{self.terminal_name}][SCRAPE] botón Coordinar deshabilitado para "
+                f"fila {row_index} — sin turno disponible"
+            )
+            return []
 
-    async def _extract_slot_rows(self, ctx: Page | Frame, container: str) -> list[dict]:
-        """Itera las filas/cards visibles y extrae (fecha, franja) si están disponibles."""
-        slots: list[dict] = []
+        # Click via dispatchEvent MouseEvent: ni el .click() de Playwright ni
+        # un btn.click() por JS disparaban el handler de Knockout; un
+        # MouseEvent 'click' con bubbles sí lo gatilla.
+        await ctx.evaluate(
+            f"""() => {{
+                const btn = document.querySelectorAll(
+                    'button.btn-primary.btn-sm.btn-icon'
+                )[{row_index}];
+                if (btn) btn.dispatchEvent(
+                    new MouseEvent('click', {{bubbles: true, cancelable: true}})
+                );
+            }}"""
+        )
+        logger.info(
+            f"[{self.terminal_name}][SCRAPE] dispatchEvent MouseEvent en botón "
+            f"índice {row_index} (contenedor {container})"
+        )
+
+        # El click en Coordinar abre el modal #viewUnitCalendarModal con el
+        # calendario de turnos. Esperar a que esté visible (clase '.show').
+        modal_selector = (
+            "#viewUnitCalendarModal.show, [id*='viewUnitCalendarModal'].show"
+        )
         try:
-            rows = ctx.locator(
-                "table tbody tr, [role='row'], [class*='slot' i], [class*='turno' i]"
+            await ctx.wait_for_selector(modal_selector, timeout=DEFAULT_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"[{self.terminal_name}][SCRAPE] no apareció el modal "
+                f"viewUnitCalendarModal para fila {row_index} (contenedor {container})"
             )
-            count = await rows.count()
-            logger.debug(
-                f"[{self.terminal_name}][SCRAPE] {count} fila(s) candidatas para {container}"
+            await self._screenshot(f"viewUnitCalendarModal_not_found_row_{row_index}")
+            return []
+        logger.info(f"[{self.terminal_name}][SCRAPE] modal Calendario abierto")
+
+        # Knockout puede tardar en poblar el modal tras abrirlo. Esperar a que
+        # el contenedor aparezca en #txtUnitId y a que el calendario tenga
+        # celdas antes de scrapear; si no, se lee un modal vacío.
+        try:
+            await ctx.wait_for_function(
+                "document.querySelector('#txtUnitId')?.value?.trim().length > 0",
+                timeout=10000,
             )
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] modal cargado — txtUnitId tiene valor"
+            )
+            await ctx.wait_for_selector("#viewUnitCalendarModal td", timeout=10000)
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"[{self.terminal_name}][SCRAPE] el modal Calendario no terminó de "
+                f"cargar (txtUnitId vacío o calendario sin días) para {container}"
+            )
+            await self._screenshot(f"modal_not_loaded_row_{row_index}")
+            return []
 
-            for i in range(count):
-                try:
-                    text = (await rows.nth(i).inner_text()).strip()
-                except Exception:
-                    continue
-                if not text:
-                    continue
+        # Confirmar el contenedor cargado en el modal.
+        try:
+            unit_id = await ctx.evaluate(
+                "document.querySelector('#txtUnitId')?.value"
+            )
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] contenedor en modal: {unit_id}"
+            )
+        except Exception:
+            pass
 
-                date_match = DATE_PATTERN.search(text)
-                time_match = TIME_RANGE_PATTERN.search(text)
-                if not (date_match and time_match):
-                    continue
+        # DEBUG: clases + texto de los <td> del calendario para identificar
+        # cuáles marcan los días disponibles.
+        try:
+            td_classes = await ctx.evaluate(
+                """() => Array.from(
+                    document.querySelectorAll('#viewUnitCalendarModal td')
+                )
+                    .map(td => td.className + '|' + td.innerText.trim())
+                    .filter(x => x.includes('|') && x.split('|')[1])
+                    .slice(0, 20)
+                    .join(' // ')"""
+            )
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] clases de tds del calendario: "
+                f"{td_classes}"
+            )
+        except Exception:
+            pass
 
-                # Filtrar filas que muestran indicadores de NO disponibilidad.
-                lower = text.lower()
-                if any(k in lower for k in ("ocupado", "completo", "no disponible", "reservado")):
-                    continue
+        # El modal es un calendario mensual: los días disponibles están
+        # resaltados con una clase/estilo distinto al resto. SOLO LEER.
 
+        # Mes/año mostrado en el encabezado del calendario.
+        mes = ""
+        try:
+            mes = (
+                await ctx.locator(
+                    ".modal.show .modal-body strong, .modal.show h4, .modal.show h3"
+                ).first.inner_text()
+            ).strip()
+        except Exception as exc:
+            logger.warning(
+                f"[{self.terminal_name}][SCRAPE] no pude leer el mes del calendario: {exc}"
+            )
+        logger.info(f"[{self.terminal_name}][SCRAPE] mes visible: {mes}")
+
+        # Días resaltados (disponibles).
+        dias = ctx.locator(
+            "#viewUnitCalendarModal td.btn-primary, "
+            "#viewUnitCalendarModal td[class*='selected'], "
+            "#viewUnitCalendarModal td[class*='active'], "
+            "#viewUnitCalendarModal td[style*='background']"
+        )
+        try:
+            dias_count = await dias.count()
+        except Exception as exc:
+            logger.error(
+                f"[{self.terminal_name}][SCRAPE] error contando días resaltados: {exc}"
+            )
+            dias_count = 0
+        logger.info(
+            f"[{self.terminal_name}][SCRAPE] {dias_count} días resaltados en calendario"
+        )
+
+        slots: list[dict] = []
+        for i in range(dias_count):
+            try:
+                dia = (await dias.nth(i).inner_text()).strip()
+            except Exception:
+                continue
+            if dia.isdigit():
                 slots.append(
                     {
                         "contenedor": container,
-                        "fecha": date_match.group(1),
-                        "franja": f"{time_match.group(1)}-{time_match.group(2)}",
+                        "fecha": f"{dia} {mes}".strip(),
+                        "franja": "INGRESO",
                     }
                 )
+
+        # Cerrar el modal antes de retornar para dejar el portal en estado limpio.
+        try:
+            await ctx.click(
+                "#viewUnitCalendarModal button.close, "
+                "#viewUnitCalendarModal .btn-secondary",
+                timeout=DEFAULT_TIMEOUT_MS,
+            )
+            await ctx.wait_for_selector(
+                "#viewUnitCalendarModal", state="hidden", timeout=5000
+            )
+            logger.info(f"[{self.terminal_name}][SCRAPE] modal Calendario cerrado")
         except Exception as exc:
-            logger.exception(
-                f"[{self.terminal_name}][SCRAPE] error extrayendo slots de {container}: {exc}"
+            logger.warning(
+                f"[{self.terminal_name}][SCRAPE] no pude cerrar el modal Calendario: {exc}"
             )
 
-        logger.info(f"[{self.terminal_name}][SCRAPE] {len(slots)} slot(s) extraído(s) para {container}")
+        logger.info(
+            f"[{self.terminal_name}][SCRAPE] {len(slots)} slot(s) para {container}"
+        )
         return slots
-
-    async def _return_to_results(self, ctx: Page | Frame, booking: str) -> bool:
-        """Vuelve a la grilla de resultados para procesar el próximo contenedor.
-
-        Estrategia: re-navegar a coordinationManagement y rehacer la búsqueda.
-        Es más robusto que `page.go_back()` en SPAs donde el history puede no
-        reflejar los pasos internos de la UI.
-        """
-        if not await self._go_to_coordination():
-            return False
-        ctx2 = await self._active_context()
-        if not await self._select_exportacion(ctx2):
-            return False
-        if not await self._submit_booking(ctx2, booking):
-            return False
-        return True
