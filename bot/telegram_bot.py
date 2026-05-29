@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 from loguru import logger
 from telegram import Bot, Update
@@ -32,15 +32,15 @@ WORKER_LAST_RUN_KEY = "worker:last_run"
 WORKER_LAST_ERROR_KEY = "worker:last_error"
 
 # Días de la semana en español (datetime.weekday(): Lunes=0 .. Domingo=6).
-DAYS_ES: list[str] = [
-    "Lunes",
-    "Martes",
-    "Miércoles",
-    "Jueves",
-    "Viernes",
-    "Sábado",
-    "Domingo",
-]
+DAYS_ES: dict[int, str] = {
+    0: "Lunes",
+    1: "Martes",
+    2: "Miércoles",
+    3: "Jueves",
+    4: "Viernes",
+    5: "Sábado",
+    6: "Domingo",
+}
 
 
 # ---- Helpers ------------------------------------------------------------
@@ -111,10 +111,16 @@ def _load_items(redis_client: RedisClient) -> list[dict]:
 
 
 def _format_fecha(fecha: str) -> str:
-    """Convierte 'YYYY-MM-DD' a 'Día DD/MM' en español. Si falla, devuelve crudo."""
+    """Convierte 'YYYY-MM-DD' a 'Día DD/MM' en español. Si falla, devuelve crudo.
+
+    Se parsea como `date` puro (no `datetime`) para evitar cualquier conversión
+    de zona horaria: con datetime+UTC, "2026-05-31" en Argentina (UTC-3) podía
+    interpretarse como el día anterior y arrojar el nombre de día equivocado.
+    """
     try:
-        dt = datetime.strptime(fecha, "%Y-%m-%d")
-        return f"{DAYS_ES[dt.weekday()]} {dt.strftime('%d/%m')}"
+        fecha_date = date.fromisoformat(fecha)
+        dia_nombre = DAYS_ES[fecha_date.weekday()]
+        return f"{dia_nombre} {fecha_date.day:02d}/{fecha_date.month:02d}"
     except Exception:
         return fecha
 
