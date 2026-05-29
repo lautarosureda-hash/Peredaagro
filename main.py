@@ -42,14 +42,17 @@ async def _main() -> None:
     application = setup_bot(redis_client)
 
     scheduler = AsyncIOScheduler()
+    # AsyncIOScheduler corre la corutina directamente sobre el event loop
+    # de asyncio — no hay que envolverla en un lambda + create_task (eso
+    # rompía con "RuntimeError: no running event loop").
     scheduler.add_job(
-        lambda: asyncio.create_task(
-            run_check_cycle(application, redis_client)
-        ),
+        run_check_cycle,
         "interval",
         minutes=interval_minutes,
+        args=[application, redis_client],
         id="check_cycle",
         next_run_time=datetime.now(),  # corre inmediatamente al arrancar
+        max_instances=1,  # evita solapamiento de ciclos
     )
     scheduler.start()
     logger.info("[MAIN][BOOT] scheduler iniciado")
