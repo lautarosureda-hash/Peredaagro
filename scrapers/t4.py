@@ -727,7 +727,11 @@ class T4Scraper(BaseScraper):
                     const results = [];
                     for (const row of rows) {
                         // Fechas de esta fila (una por columna)
-                        const dayTds = row.querySelectorAll('td[data-date]');
+                        // SOLO dentro de .fc-bg: FullCalendar duplica los
+                        // td[data-date] en .fc-bg y en .fc-content-skeleton,
+                        // así que sin filtrar dayTds traía el doble y el
+                        // índice del evento no coincidía con la fecha.
+                        const dayTds = row.querySelectorAll('.fc-bg td[data-date]');
                         // Eventos de esta fila (td.fc-event-container, uno por columna)
                         const eventTds = row.querySelectorAll('td.fc-event-container');
 
