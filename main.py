@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -42,11 +43,13 @@ async def _main() -> None:
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
-        run_check_cycle,
+        lambda: asyncio.create_task(
+            run_check_cycle(application, redis_client)
+        ),
         "interval",
         minutes=interval_minutes,
         id="check_cycle",
-        next_run_time=None,
+        next_run_time=datetime.now(),  # corre inmediatamente al arrancar
     )
     scheduler.start()
     logger.info("[MAIN][BOOT] scheduler iniciado")
