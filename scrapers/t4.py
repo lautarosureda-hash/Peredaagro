@@ -741,8 +741,14 @@ class T4Scraper(BaseScraper):
                             const cantidad = parseInt(txt, 10);
                             if (isNaN(cantidad) || cantidad <= 0) continue;
 
-                            // La fecha del día en esa columna está en dayTds[i]
-                            const fecha = dayTds[i]?.getAttribute('data-date') || '';
+                            // Los td.fc-event-container no arrancan en la
+                            // columna 0: su posición real en la fila determina
+                            // a qué fecha corresponden. Usar el índice real del
+                            // td dentro de su padre para alinear con dayTds.
+                            const realIndex = Array.from(
+                                eventTds[i].parentElement.children
+                            ).indexOf(eventTds[i]);
+                            const fecha = dayTds[realIndex]?.getAttribute('data-date') || '';
                             if (!fecha) continue;
 
                             results.push({ fecha, cantidad });
