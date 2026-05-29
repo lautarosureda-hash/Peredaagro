@@ -8,8 +8,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from loguru import logger
 
-from bot.telegram_bot import build_application
+from bot.telegram_bot import setup_bot
 from scheduler.worker import run_check_cycle
+from storage.redis_client import RedisClient
 
 
 def _configure_logger() -> None:
@@ -31,11 +32,13 @@ async def _main() -> None:
         raise SystemExit(1)
 
     interval_minutes = int(os.environ.get("MONITOR_INTERVAL_MINUTES", "10"))
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
     logger.info("[MAIN][BOOT] arrancando terminal-monitor")
     logger.info(f"[MAIN][BOOT] intervalo de monitoreo: {interval_minutes} min")
 
-    application = build_application(token)
+    redis_client = RedisClient(redis_url)
+    application = setup_bot(redis_client)
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(

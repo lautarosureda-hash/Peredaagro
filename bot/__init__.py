@@ -1,3 +1,3 @@
-from bot.telegram_bot import build_application, send_alert
+from bot.telegram_bot import send_alert, setup_bot
 
-__all__ = ["build_application", "send_alert"]
+__all__ = ["setup_bot", "send_alert"]
