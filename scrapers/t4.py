@@ -689,12 +689,14 @@ class T4Scraper(BaseScraper):
         # El modal es un calendario mensual: los días disponibles están
         # resaltados con una clase/estilo distinto al resto. SOLO LEER.
 
-        # Mes/año mostrado en el encabezado del calendario.
+        # Mes/año mostrado en el encabezado del calendario. FullCalendar lo
+        # renderiza en un <h2> dentro de la toolbar (.fc-center / .fc-toolbar).
         mes = ""
         try:
             mes = (
                 await ctx.locator(
-                    ".modal.show .modal-body strong, .modal.show h4, .modal.show h3"
+                    "#viewUnitCalendarModal .fc-center h2, "
+                    "#viewUnitCalendarModal .fc-toolbar h2"
                 ).first.inner_text()
             ).strip()
         except Exception as exc:
@@ -703,12 +705,12 @@ class T4Scraper(BaseScraper):
             )
         logger.info(f"[{self.terminal_name}][SCRAPE] mes visible: {mes}")
 
-        # Días resaltados (disponibles).
+        # Días disponibles. FullCalendar marca cada celda de día con la clase
+        # 'fc-day-number'. Los días pasados llevan además 'fc-past' y los de
+        # otros meses 'fc-other-month'. Los disponibles son los del mes actual
+        # que NO son pasados — fc-day-number sin fc-past ni fc-other-month.
         dias = ctx.locator(
-            "#viewUnitCalendarModal td.btn-primary, "
-            "#viewUnitCalendarModal td[class*='selected'], "
-            "#viewUnitCalendarModal td[class*='active'], "
-            "#viewUnitCalendarModal td[style*='background']"
+            "#viewUnitCalendarModal td.fc-day-number:not(.fc-past):not(.fc-other-month)"
         )
         try:
             dias_count = await dias.count()
