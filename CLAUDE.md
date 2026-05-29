@@ -10,12 +10,12 @@ Las terminales portuarias publican turnos con muy poca antelación y se agotan e
 ## Stack
 
 - Python 3.11+
-- Playwright 1.44.0 (scraping con browser real, login en portales con JS)
-- APScheduler 3.10.4 (ciclo de monitoreo periódico)
-- python-telegram-bot 21.3 (handlers de comandos + alertas)
-- Redis 5.0.4 (estado de items monitoreados y último snapshot de slots)
-- loguru 0.7.2 (logging estructurado)
-- python-dotenv 1.0.1 (carga de credenciales)
+- Playwright 1.59.0 (scraping con browser real, login en portales con JS)
+- APScheduler 3.11.2 (ciclo de monitoreo periódico)
+- python-telegram-bot 22.7 (handlers de comandos + alertas)
+- Redis 7.4.0 (estado de items monitoreados y último snapshot de slots)
+- loguru 0.7.3 (logging estructurado)
+- python-dotenv 1.2.2 (carga de credenciales)
 - Hosting: Railway
 
 ## Reglas de desarrollo
