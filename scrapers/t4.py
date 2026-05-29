@@ -251,18 +251,29 @@ class T4Scraper(BaseScraper):
                 f"{[r['contenedor'] for r in rows]}"
             )
 
-            # Paso 6+7: usar SIEMPRE el primer contenedor de la grilla.
-            # Se clickea el calendario azul de su columna Coordinar y se
-            # scrapean los turnos que se despliegan.
-            first = rows[0]
-            logger.info(
-                f"[{self.terminal_name}][SCRAPE] usando primer contenedor "
-                f"{first['contenedor']} (row_index={first['row_index']})"
-            )
-            results = await self._get_slots_for_container(
-                first["row_index"], desde_fecha=desde_fecha
-            )
-            return results
+            # Paso 6+7: probar los contenedores en orden hasta encontrar uno
+            # con turnos disponibles. Un contenedor que ya tiene turno asignado
+            # abre el calendario vacío, así que no alcanza con el primero.
+            for row in rows:
+                logger.info(
+                    f"[{self.terminal_name}][SCRAPE] chequeando contenedor "
+                    f"{row['contenedor']} (row_index={row['row_index']})"
+                )
+                slots = await self._get_slots_for_container(
+                    row["row_index"], desde_fecha=desde_fecha
+                )
+                if slots:
+                    logger.info(
+                        f"[{self.terminal_name}][SCRAPE] slots encontrados en "
+                        f"{row['contenedor']} — usando estos resultados"
+                    )
+                    return slots
+                logger.info(
+                    f"[{self.terminal_name}][SCRAPE] {row['contenedor']} sin "
+                    f"slots — probando siguiente"
+                )
+
+            return []
 
         except Exception as exc:
             logger.exception(
