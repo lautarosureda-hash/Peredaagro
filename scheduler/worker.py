@@ -19,18 +19,19 @@ ITEMS_KEY = "items:active"
 WORKER_LAST_RUN_KEY = "worker:last_run"
 WORKER_LAST_ERROR_KEY = "worker:last_error"
 
-# Terminales con scraper implementado. A medida que se agreguen TRP/Exolgan
-# se registran acá.
+# Máximo de caracteres para el mensaje de error guardado en Redis.
+# Telegram tiene un límite de 4096 caracteres por mensaje; /status compone
+# otras líneas también, así que acotamos el error a 300 chars.
+MAX_ERROR_LEN = 300
+
+# Terminales con scraper implementado.
 SCRAPERS: dict[str, type[BaseScraper]] = {
     "T4": T4Scraper,
 }
 
 
 def _load_items(redis_client: RedisClient) -> list[dict]:
-    """Lee los items activos del hash ITEMS_KEY.
-
-    Cada item: {"id", "terminal", "booking", "desde_fecha"}.
-    """
+    """Lee los items activos del hash ITEMS_KEY."""
     try:
         raw = redis_client.client.hgetall(ITEMS_KEY)
     except Exception as exc:
@@ -55,7 +56,7 @@ def _load_items(redis_client: RedisClient) -> list[dict]:
 
 
 def _config_for(terminal: str) -> dict:
-    """Arma el config del scraper desde el entorno: {TERMINAL}_URL/_USER/_PASS."""
+    """Arma el config del scraper desde el entorno."""
     t = terminal.upper()
     return {
         "url": os.environ.get(f"{t}_URL", ""),
@@ -67,9 +68,12 @@ def _config_for(terminal: str) -> dict:
 def _record_last_error(
     redis_client: RedisClient, terminal: str, booking: str, exc: object
 ) -> None:
-    """Guarda en Redis el último error del worker para que /status lo muestre."""
+    """Guarda en Redis el último error del worker (truncado) para /status."""
     stamp = datetime.utcnow().isoformat() + "Z"
-    msg = f"{stamp} — {terminal}/{booking}: {exc}"
+    # Tomamos solo la primera línea del traceback para no superar el límite
+    # de caracteres de Telegram en /status.
+    exc_str = str(exc).split("\n")[0][:MAX_ERROR_LEN]
+    msg = f"{stamp} — {terminal}/{booking}: {exc_str}"
     try:
         redis_client.client.set(WORKER_LAST_ERROR_KEY, msg)
     except Exception as set_exc:
@@ -79,12 +83,7 @@ def _record_last_error(
 async def run_check_cycle(
     app: Application, redis_client: RedisClient
 ) -> None:
-    """Ejecuta un ciclo completo de chequeo de disponibilidad.
-
-    Lee los items activos de Redis, corre el scraper de cada terminal en un
-    browser headless, compara con el snapshot anterior y dispara alertas por
-    Telegram ante slots nuevos. Nunca propaga excepciones.
-    """
+    """Ejecuta un ciclo completo de chequeo de disponibilidad."""
     start = datetime.utcnow()
     logger.info(f"[WORKER][CYCLE] inicio {start.isoformat()}Z")
 
@@ -97,7 +96,6 @@ async def run_check_cycle(
         if not items:
             logger.info("[WORKER] no hay items activos — nada que chequear")
         else:
-            # Agrupar por terminal para reusar el mismo browser/sesión.
             by_terminal: dict[str, list[dict]] = {}
             for item in items:
                 by_terminal.setdefault(item["terminal"], []).append(item)
@@ -131,8 +129,6 @@ async def run_check_cycle(
                                 f"({item_id})"
                             )
                             try:
-                                # Login una sola vez por terminal; reusar la
-                                # sesión si ya está activa.
                                 if not logged_in:
                                     if not await scraper.login():
                                         logger.error(
@@ -152,8 +148,6 @@ async def run_check_cycle(
                                     booking, desde_fecha=desde
                                 )
 
-                                # Diff contra el snapshot anterior: un slot es
-                                # nuevo si su fecha no estaba guardada.
                                 prev = (
                                     redis_client.get_state(terminal, booking) or []
                                 )
@@ -177,11 +171,9 @@ async def run_check_cycle(
                                         f"[WORKER] sin cambios para {booking}"
                                     )
 
-                                # Persistir el nuevo snapshot.
                                 redis_client.set_state(terminal, booking, slots)
                                 checked += 1
                             except Exception as exc:
-                                # El error de un item no detiene a los demás.
                                 logger.exception(
                                     f"[WORKER] error chequeando {terminal}/"
                                     f"{booking}: {exc}"
@@ -192,11 +184,9 @@ async def run_check_cycle(
                 finally:
                     await browser.close()
     except Exception as exc:
-        # Nunca propagar fuera del ciclo: el scheduler debe seguir corriendo.
         logger.exception(f"[WORKER] excepción inesperada en el ciclo: {exc}")
         _record_last_error(redis_client, "?", "?", exc)
 
-    # Marcar la última corrida (siempre, aun si no hubo items).
     run_ts = datetime.utcnow().isoformat() + "Z"
     try:
         redis_client.client.set(WORKER_LAST_RUN_KEY, run_ts)
