@@ -206,13 +206,18 @@ class T4Scraper(BaseScraper):
 
     # ---- check_availability ----------------------------------------------
 
-    async def check_availability(self, booking: str) -> list[dict]:
+    async def check_availability(
+        self, booking: str, desde_fecha: str | None = None
+    ) -> list[dict]:
         """Consulta los turnos disponibles para un booking de exportación.
 
         Retorna list[dict] con shape:
-            {"contenedor": str, "fecha": str, "franja": str}
+            {"contenedor": str, "fecha": str, "cantidad": int, "franja": str}
         Si no hay slots o algo falla, retorna [].
         Nunca propaga excepciones — siempre vuelve a base_url antes de salir.
+
+        `desde_fecha` (formato "YYYY-MM-DD") filtra slots: si se pasa, solo se
+        incluyen los que tengan fecha >= desde_fecha.
         """
         if not booking:
             logger.error(f"[{self.terminal_name}][SCRAPE] booking vacío")
@@ -254,7 +259,9 @@ class T4Scraper(BaseScraper):
                 f"[{self.terminal_name}][SCRAPE] usando primer contenedor "
                 f"{first['contenedor']} (row_index={first['row_index']})"
             )
-            results = await self._get_slots_for_container(first["row_index"])
+            results = await self._get_slots_for_container(
+                first["row_index"], desde_fecha=desde_fecha
+            )
             return results
 
         except Exception as exc:
@@ -520,11 +527,16 @@ class T4Scraper(BaseScraper):
         )
         return items
 
-    async def _get_slots_for_container(self, row_index: int) -> list[dict]:
+    async def _get_slots_for_container(
+        self, row_index: int, desde_fecha: str | None = None
+    ) -> list[dict]:
         """Clickea el calendario azul de la columna 'Coordinar' en la fila
         row_index y scrapea los turnos disponibles que se abren.
 
         SOLO lee — nunca clickea botones de confirmar/reservar.
+
+        `desde_fecha` (formato "YYYY-MM-DD") filtra slots: si se pasa, solo se
+        incluyen los que tengan fecha >= desde_fecha.
         """
         ctx = await self._active_context()
 
@@ -686,57 +698,75 @@ class T4Scraper(BaseScraper):
         except Exception:
             pass
 
-        # El modal es un calendario mensual: los días disponibles están
-        # resaltados con una clase/estilo distinto al resto. SOLO LEER.
-
-        # Mes/año mostrado en el encabezado del calendario. FullCalendar lo
-        # renderiza en un <h2> dentro de la toolbar (.fc-center / .fc-toolbar).
-        mes = ""
+        # El modal es un calendario mensual de FullCalendar. SOLO LEER.
+        #
+        # FullCalendar organiza el grid en filas (.fc-day-grid .fc-row). Cada
+        # fila tiene dos sub-estructuras paralelas:
+        #   1. .fc-bg con td[data-date]      → la fecha exacta de cada columna
+        #   2. .fc-content-skeleton con td.fc-event-container → los eventos
+        #      (turnos disponibles) de cada columna
+        # La columna del evento coincide por índice con la columna del día en
+        # la misma fila, así que dayTds[i] da la fecha del evento eventTds[i].
         try:
-            mes = (
-                await ctx.locator(
-                    "#viewUnitCalendarModal .fc-center h2, "
-                    "#viewUnitCalendarModal .fc-toolbar h2"
-                ).first.inner_text()
-            ).strip()
-        except Exception as exc:
-            logger.warning(
-                f"[{self.terminal_name}][SCRAPE] no pude leer el mes del calendario: {exc}"
+            slots_data = await ctx.evaluate(
+                """() => {
+                    const rows = document.querySelectorAll(
+                        '#viewUnitCalendarModal .fc-day-grid .fc-row'
+                    );
+                    const results = [];
+                    for (const row of rows) {
+                        // Fechas de esta fila (una por columna)
+                        const dayTds = row.querySelectorAll('td[data-date]');
+                        // Eventos de esta fila (td.fc-event-container, uno por columna)
+                        const eventTds = row.querySelectorAll('td.fc-event-container');
+
+                        for (let i = 0; i < eventTds.length; i++) {
+                            const txt = eventTds[i].innerText.trim();
+                            if (!txt) continue; // columna sin evento
+                            const cantidad = parseInt(txt, 10);
+                            if (isNaN(cantidad) || cantidad <= 0) continue;
+
+                            // La fecha del día en esa columna está en dayTds[i]
+                            const fecha = dayTds[i]?.getAttribute('data-date') || '';
+                            if (!fecha) continue;
+
+                            results.push({ fecha, cantidad });
+                        }
+                    }
+                    return results;
+                }"""
             )
-        logger.info(f"[{self.terminal_name}][SCRAPE] mes visible: {mes}")
-
-        # Días disponibles. FullCalendar marca cada celda de día con la clase
-        # 'fc-day-number'. Los días pasados llevan además 'fc-past' y los de
-        # otros meses 'fc-other-month'. Los disponibles son los del mes actual
-        # que NO son pasados — fc-day-number sin fc-past ni fc-other-month.
-        dias = ctx.locator(
-            "#viewUnitCalendarModal td.fc-day-number:not(.fc-past):not(.fc-other-month)"
-        )
-        try:
-            dias_count = await dias.count()
         except Exception as exc:
             logger.error(
-                f"[{self.terminal_name}][SCRAPE] error contando días resaltados: {exc}"
+                f"[{self.terminal_name}][SCRAPE] error extrayendo slots del "
+                f"calendario: {exc}"
             )
-            dias_count = 0
-        logger.info(
-            f"[{self.terminal_name}][SCRAPE] {dias_count} días resaltados en calendario"
-        )
+            slots_data = []
+
+        logger.info(f"[{self.terminal_name}][SCRAPE] slots encontrados: {slots_data}")
 
         slots: list[dict] = []
-        for i in range(dias_count):
-            try:
-                dia = (await dias.nth(i).inner_text()).strip()
-            except Exception:
+        for slot in slots_data:
+            fecha = slot.get("fecha", "")
+            cantidad = slot.get("cantidad", 0)
+            if not fecha:
                 continue
-            if dia.isdigit():
-                slots.append(
-                    {
-                        "contenedor": container,
-                        "fecha": f"{dia} {mes}".strip(),
-                        "franja": "INGRESO",
-                    }
-                )
+            # Filtro opcional por fecha mínima (comparación lexicográfica
+            # válida para el formato YYYY-MM-DD).
+            if desde_fecha and fecha < desde_fecha:
+                continue
+            logger.info(
+                f"[{self.terminal_name}][SCRAPE] {fecha} — {cantidad} turnos "
+                f"({container})"
+            )
+            slots.append(
+                {
+                    "contenedor": container,
+                    "fecha": fecha,
+                    "cantidad": cantidad,
+                    "franja": "INGRESO",
+                }
+            )
 
         # Cerrar el modal antes de retornar para dejar el portal en estado limpio.
         try:
