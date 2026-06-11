@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime
@@ -23,6 +24,13 @@ WORKER_LAST_ERROR_KEY = "worker:last_error"
 # Telegram tiene un límite de 4096 caracteres por mensaje; /status compone
 # otras líneas también, así que acotamos el error a 300 chars.
 MAX_ERROR_LEN = 300
+
+# Timeout global del ciclo completo. Si run_check_cycle tarda más que esto,
+# se cancela forzosamente para que el scheduler (max_instances=1) pueda
+# arrancar el siguiente ciclo en lugar de quedar bloqueado para siempre con
+# "maximum number of running instances reached". 480s = 8 min, holgado frente
+# al intervalo default de 10 min entre ciclos.
+CYCLE_TIMEOUT_SECONDS = 480
 
 # Terminales con scraper implementado.
 SCRAPERS: dict[str, type[BaseScraper]] = {
@@ -80,10 +88,11 @@ def _record_last_error(
         logger.error(f"[WORKER] no pude guardar worker:last_error: {set_exc}")
 
 
-async def run_check_cycle(
+async def _run_check_cycle(
     app: Application, redis_client: RedisClient
 ) -> None:
-    """Ejecuta un ciclo completo de chequeo de disponibilidad."""
+    """Cuerpo del ciclo de chequeo. No aplica timeout — lo hace el wrapper
+    público `run_check_cycle`."""
     start = datetime.utcnow()
     logger.info(f"[WORKER][CYCLE] inicio {start.isoformat()}Z")
 
@@ -197,3 +206,43 @@ async def run_check_cycle(
     logger.info(
         f"[WORKER] ciclo completo — {checked} items chequeados ({duration:.2f}s)"
     )
+
+
+async def run_check_cycle(
+    app: Application, redis_client: RedisClient
+) -> None:
+    """Ejecuta un ciclo completo de chequeo con un timeout global duro.
+
+    Envuelve `_run_check_cycle` en `asyncio.wait_for(timeout=480)`. Si el ciclo
+    se cuelga (p. ej. un `browser.close()` o una operación de Playwright que no
+    respeta su timeout propio), la corutina interna se cancela y este ciclo
+    termina, dejando que el scheduler (max_instances=1) pueda lanzar el
+    siguiente en vez de quedar bloqueado para siempre.
+    """
+    start = datetime.utcnow()
+    try:
+        await asyncio.wait_for(
+            _run_check_cycle(app, redis_client),
+            timeout=CYCLE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        duration = (datetime.utcnow() - start).total_seconds()
+        logger.error(
+            f"[WORKER][CYCLE] timeout global — ciclo cancelado tras "
+            f"{duration:.0f}s (límite {CYCLE_TIMEOUT_SECONDS}s). El scheduler "
+            f"podrá arrancar el próximo ciclo."
+        )
+        _record_last_error(
+            redis_client,
+            "?",
+            "?",
+            f"ciclo cancelado por timeout global ({CYCLE_TIMEOUT_SECONDS}s)",
+        )
+        # Garantizar que /status refleje que hubo una corrida (aunque abortada),
+        # ya que el cuerpo interno no llegó a escribir worker:last_run.
+        try:
+            redis_client.client.set(
+                WORKER_LAST_RUN_KEY, datetime.utcnow().isoformat() + "Z"
+            )
+        except Exception as exc:
+            logger.error(f"[WORKER] no pude guardar worker:last_run: {exc}")
