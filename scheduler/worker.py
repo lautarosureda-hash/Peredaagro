@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
+import subprocess
+import sys
 from datetime import datetime
 
+from dotenv import load_dotenv
 from loguru import logger
 from playwright.async_api import async_playwright
-from telegram.ext import Application
+from telegram import Bot
 
 from bot.telegram_bot import send_alert
 from scrapers.base import BaseScraper
@@ -25,12 +29,19 @@ WORKER_LAST_ERROR_KEY = "worker:last_error"
 # otras líneas también, así que acotamos el error a 300 chars.
 MAX_ERROR_LEN = 300
 
-# Timeout global del ciclo completo. Si run_check_cycle tarda más que esto,
-# se cancela forzosamente para que el scheduler (max_instances=1) pueda
-# arrancar el siguiente ciclo en lugar de quedar bloqueado para siempre con
-# "maximum number of running instances reached". 480s = 8 min, holgado frente
-# al intervalo default de 10 min entre ciclos.
+# Timeout global del ciclo completo. El ciclo corre en un SUBPROCESS separado;
+# si tarda más que esto se mata el árbol de procesos completo (incluido el
+# driver node de Playwright), garantizando que el scheduler (max_instances=1)
+# pueda arrancar el siguiente ciclo aunque Playwright se congele por completo.
+# 480s = 8 min, holgado frente al intervalo default de 10 min entre ciclos.
 CYCLE_TIMEOUT_SECONDS = 480
+
+# Tiempo de gracia para que el SO recoja el proceso después de mandarle el kill.
+KILL_REAP_TIMEOUT_SECONDS = 15
+
+# El kill del árbol de procesos difiere por plataforma (Railway = Linux,
+# desarrollo local = Windows).
+IS_WINDOWS = os.name == "nt"
 
 # Terminales con scraper implementado.
 SCRAPERS: dict[str, type[BaseScraper]] = {
@@ -88,16 +99,14 @@ def _record_last_error(
         logger.error(f"[WORKER] no pude guardar worker:last_error: {set_exc}")
 
 
-async def _run_check_cycle(
-    app: Application, redis_client: RedisClient
-) -> None:
-    """Cuerpo del ciclo de chequeo. No aplica timeout — lo hace el wrapper
-    público `run_check_cycle`."""
+async def _run_check_cycle(bot: Bot, redis_client: RedisClient) -> None:
+    """Cuerpo del ciclo de chequeo. Corre dentro del subprocess de ciclo; el
+    timeout duro lo aplica el wrapper público `run_check_cycle` en el proceso
+    padre matando este subprocess."""
     start = datetime.utcnow()
     logger.info(f"[WORKER][CYCLE] inicio {start.isoformat()}Z")
 
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-    bot = app.bot
     checked = 0
 
     try:
@@ -208,41 +217,180 @@ async def _run_check_cycle(
     )
 
 
-async def run_check_cycle(
-    app: Application, redis_client: RedisClient
-) -> None:
-    """Ejecuta un ciclo completo de chequeo con un timeout global duro.
+def _safe_set_last_run(redis_client: RedisClient) -> None:
+    """Marca en Redis que hubo una corrida (aunque haya sido abortada), para
+    que /status no quede mostrando una corrida vieja."""
+    try:
+        redis_client.client.set(
+            WORKER_LAST_RUN_KEY, datetime.utcnow().isoformat() + "Z"
+        )
+    except Exception as exc:
+        logger.error(f"[WORKER] no pude guardar worker:last_run: {exc}")
 
-    Envuelve `_run_check_cycle` en `asyncio.wait_for(timeout=480)`. Si el ciclo
-    se cuelga (p. ej. un `browser.close()` o una operación de Playwright que no
-    respeta su timeout propio), la corutina interna se cancela y este ciclo
-    termina, dejando que el scheduler (max_instances=1) pueda lanzar el
-    siguiente en vez de quedar bloqueado para siempre.
+
+async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """Mata el subprocess del ciclo y TODO su árbol de hijos.
+
+    Es imprescindible matar el árbol completo (no solo el proceso python): el
+    driver de Playwright lanza un proceso node + chromium como hijos; matar
+    solo el python dejaría esos huérfanos colgados consumiendo memoria. Por eso
+    en Linux mandamos SIGKILL a todo el grupo de procesos y en Windows usamos
+    `taskkill /T` (recursivo).
+    """
+    if proc.returncode is not None:
+        return
+
+    if IS_WINDOWS:
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill", "/F", "/T", "/PID", str(proc.pid),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            await killer.wait()
+        except Exception as exc:
+            logger.error(f"[WORKER][CYCLE] taskkill falló: {exc}")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+    else:
+        # SIGKILL al grupo de procesos completo (creado con start_new_session).
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger.error(f"[WORKER][CYCLE] killpg falló: {exc}")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+    # Esperar a que el SO recoja el proceso para no dejar zombies.
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=KILL_REAP_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error(
+            f"[WORKER][CYCLE] el subprocess pid {proc.pid} no terminó tras el "
+            f"kill ({KILL_REAP_TIMEOUT_SECONDS}s)"
+        )
+
+
+async def run_check_cycle(redis_client: RedisClient) -> None:
+    """Ejecuta un ciclo completo de chequeo en un SUBPROCESS con timeout duro.
+
+    El ciclo (login + scraping con Playwright) corre en un proceso aparte
+    (`python -m scheduler.worker`). Si tarda más de `CYCLE_TIMEOUT_SECONDS` se
+    mata el árbol de procesos completo —incluido el driver node de Playwright—,
+    garantizando que el scheduler (max_instances=1) pueda lanzar el próximo
+    ciclo aunque Playwright se cuelgue de forma irrecuperable. A diferencia de
+    `asyncio.wait_for` sobre una corutina, matar el proceso es un corte real:
+    el SO recupera todos los recursos sin depender de que Playwright respete la
+    cancelación.
+
+    El subprocess hereda stdout/stderr, así que sus logs aparecen integrados en
+    los del proceso principal (Railway). Reconstruye sus propias conexiones a
+    Redis y a Telegram desde el entorno, por lo que no necesita compartir
+    objetos con el proceso padre.
     """
     start = datetime.utcnow()
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # Aislar el subprocess en su propio grupo/sesión de procesos para poder
+    # matar todo el árbol de una (ver _kill_process_tree).
+    spawn_kwargs: dict = {}
+    if IS_WINDOWS:
+        spawn_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        spawn_kwargs["start_new_session"] = True
+
     try:
-        await asyncio.wait_for(
-            _run_check_cycle(app, redis_client),
-            timeout=CYCLE_TIMEOUT_SECONDS,
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "scheduler.worker",
+            cwd=repo_root,
+            **spawn_kwargs,
         )
+    except Exception as exc:
+        logger.exception(f"[WORKER][CYCLE] no pude lanzar el subprocess: {exc}")
+        _record_last_error(redis_client, "?", "?", f"no pude lanzar el ciclo: {exc}")
+        _safe_set_last_run(redis_client)
+        return
+
+    logger.info(f"[WORKER][CYCLE] subprocess lanzado (pid {proc.pid})")
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=CYCLE_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         duration = (datetime.utcnow() - start).total_seconds()
         logger.error(
-            f"[WORKER][CYCLE] timeout global — ciclo cancelado tras "
-            f"{duration:.0f}s (límite {CYCLE_TIMEOUT_SECONDS}s). El scheduler "
-            f"podrá arrancar el próximo ciclo."
+            f"[WORKER][CYCLE] timeout global — matando subprocess pid {proc.pid} "
+            f"tras {duration:.0f}s (límite {CYCLE_TIMEOUT_SECONDS}s). El "
+            f"scheduler podrá arrancar el próximo ciclo."
         )
+        await _kill_process_tree(proc)
         _record_last_error(
             redis_client,
             "?",
             "?",
-            f"ciclo cancelado por timeout global ({CYCLE_TIMEOUT_SECONDS}s)",
+            f"ciclo cancelado por timeout global ({CYCLE_TIMEOUT_SECONDS}s) — "
+            f"subprocess terminado",
         )
-        # Garantizar que /status refleje que hubo una corrida (aunque abortada),
-        # ya que el cuerpo interno no llegó a escribir worker:last_run.
-        try:
-            redis_client.client.set(
-                WORKER_LAST_RUN_KEY, datetime.utcnow().isoformat() + "Z"
-            )
-        except Exception as exc:
-            logger.error(f"[WORKER] no pude guardar worker:last_run: {exc}")
+        # El subprocess no llegó a escribir worker:last_run; lo hacemos acá.
+        _safe_set_last_run(redis_client)
+        return
+
+    rc = proc.returncode
+    if rc == 0:
+        logger.info(f"[WORKER][CYCLE] subprocess finalizó ok (pid {proc.pid})")
+    else:
+        # El subprocess ya registró el error puntual en Redis (_record_last_error);
+        # esto cubre crashes que no alcanzaron a hacerlo (segfault, OOM, etc.).
+        logger.error(
+            f"[WORKER][CYCLE] subprocess pid {proc.pid} terminó con código {rc}"
+        )
+        _record_last_error(
+            redis_client, "?", "?", f"subprocess de ciclo terminó con código {rc}"
+        )
+        _safe_set_last_run(redis_client)
+
+
+def _configure_subprocess_logger() -> None:
+    """Mismo formato de log que main.py, para que los logs del subprocess se
+    vean consistentes en Railway."""
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        format=(
+            "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+            "<level>{level: <8}</level> | {message}"
+        ),
+        level="INFO",
+    )
+
+
+async def _cycle_entrypoint() -> None:
+    """Punto de entrada del subprocess de ciclo (`python -m scheduler.worker`).
+
+    Construye sus propias conexiones (Redis + Bot de Telegram) desde el entorno
+    y corre un único ciclo de chequeo. Se mantiene autónomo a propósito: no
+    comparte ningún objeto con el proceso padre.
+    """
+    load_dotenv()
+    _configure_subprocess_logger()
+
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        logger.error("[WORKER][CYCLE] falta TELEGRAM_BOT_TOKEN — no puedo alertar")
+
+    redis_client = RedisClient(redis_url)
+    bot = Bot(token)
+    # `async with bot` inicializa/cierra el Bot (necesario en PTB para usar
+    # send_message fuera de una Application).
+    async with bot:
+        await _run_check_cycle(bot, redis_client)
+
+
+if __name__ == "__main__":
+    asyncio.run(_cycle_entrypoint())

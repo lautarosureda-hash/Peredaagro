@@ -45,11 +45,14 @@ async def _main() -> None:
     # AsyncIOScheduler corre la corutina directamente sobre el event loop
     # de asyncio — no hay que envolverla en un lambda + create_task (eso
     # rompía con "RuntimeError: no running event loop").
+    # run_check_cycle lanza el ciclo en un subprocess aparte (ver worker.py),
+    # así que solo necesita el redis_client del padre para registrar estado;
+    # el subprocess reconstruye su propio Bot de Telegram desde el entorno.
     scheduler.add_job(
         run_check_cycle,
         "interval",
         minutes=interval_minutes,
-        args=[application, redis_client],
+        args=[redis_client],
         id="check_cycle",
         next_run_time=datetime.now(),  # corre inmediatamente al arrancar
         max_instances=1,  # evita solapamiento de ciclos
