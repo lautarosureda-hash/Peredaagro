@@ -20,7 +20,17 @@ class RedisClient:
 
     def __init__(self, redis_url: str) -> None:
         self.redis_url = redis_url
-        self.client: redis.Redis = redis.Redis.from_url(redis_url, decode_responses=True)
+        # Timeouts de socket: sin esto, una conexión colgada (red caída hacia
+        # el add-on de Railway) bloquea para siempre la llamada síncrona y, como
+        # estas se ejecutan sobre el event loop, congelaría bot + scheduler.
+        self.client: redis.Redis = redis.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=10,
+            socket_connect_timeout=10,
+            health_check_interval=30,
+            retry_on_timeout=True,
+        )
         logger.info(f"[REDIS][INIT] conectado a {redis_url}")
 
     def get_state(self, terminal: str, identifier: str) -> list[dict] | None:

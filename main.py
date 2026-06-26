@@ -56,6 +56,8 @@ async def _main() -> None:
         id="check_cycle",
         next_run_time=datetime.now(),  # corre inmediatamente al arrancar
         max_instances=1,  # evita solapamiento de ciclos
+        coalesce=True,  # si se acumulan disparos perdidos, corre uno solo
+        misfire_grace_time=120,  # tolera hasta 2 min de atraso antes de descartar
     )
     scheduler.start()
     logger.info("[MAIN][BOOT] scheduler iniciado")
