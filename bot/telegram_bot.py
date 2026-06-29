@@ -149,6 +149,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/agregar T4 <booking> [desde:YYYY-MM-DD] — monitorear un booking\n"
         "/lista — ver bookings monitoreados\n"
         "/stop <id> — detener el monitoreo de un item\n"
+        "/check — forzar un ciclo de chequeo ahora\n"
         "/status — estado del worker\n"
         "\n"
         "Ejemplo:\n"
@@ -292,6 +293,86 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fuerza un ciclo de chequeo inmediato, sin esperar al próximo tick del
+    scheduler. Ackea al toque y avisa el resultado en una task de fondo, para no
+    dejar al usuario esperando ~30s sin respuesta."""
+    logger.info("[BOT][/check] recibido")
+    if update.message is None or not _authorized(update):
+        return
+
+    redis_client = _get_redis(context)
+    if not _redis_alive(redis_client):
+        await update.message.reply_text(
+            "⚠️ No puedo acceder al almacenamiento (Redis). Intentá de nuevo en unos minutos."
+        )
+        return
+
+    # Import lazy: scheduler.worker importa send_alert de este módulo, así que un
+    # import a nivel de módulo sería circular.
+    from scheduler.worker import is_cycle_running, run_check_cycle
+
+    if is_cycle_running():
+        await update.message.reply_text(
+            "⏳ Ya hay un ciclo en curso. Esperá a que termine."
+        )
+        return
+
+    items = _load_items(redis_client)
+    if not items:
+        await update.message.reply_text(
+            "No hay bookings monitoreados. Agregá uno con /agregar."
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(
+        f"🔄 Forzando un ciclo de chequeo de {len(items)} item(s)… "
+        f"te aviso al terminar (puede tardar ~30s)."
+    )
+
+    async def _run_and_report() -> None:
+        # Snapshot del último error ANTES del ciclo, para detectar si este ciclo
+        # en particular falló (worker:last_error es sticky: guarda el último de
+        # siempre, no necesariamente el de esta corrida).
+        try:
+            before_error = redis_client.client.get(WORKER_LAST_ERROR_KEY) or ""
+        except Exception:
+            before_error = ""
+
+        try:
+            ran = await run_check_cycle(redis_client)
+        except Exception as exc:
+            logger.exception(f"[BOT][/check] error en el ciclo forzado: {exc}")
+            await context.bot.send_message(
+                chat_id, f"⚠️ El ciclo forzado falló: {str(exc)[:300]}"
+            )
+            return
+
+        if not ran:
+            await context.bot.send_message(
+                chat_id, "⏳ Ya había otro ciclo en curso; no se forzó uno nuevo."
+            )
+            return
+
+        try:
+            after_error = redis_client.client.get(WORKER_LAST_ERROR_KEY) or ""
+        except Exception:
+            after_error = ""
+
+        if after_error and after_error != before_error:
+            await context.bot.send_message(
+                chat_id, f"⚠️ El ciclo terminó con un error:\n{after_error}"
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                "✅ Ciclo de chequeo completo. Si había turnos nuevos, ya te llegó la alerta.",
+            )
+
+    context.application.create_task(_run_and_report())
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("[BOT][/status] recibido")
     if update.message is None or not _authorized(update):
@@ -345,10 +426,11 @@ def setup_bot(redis_client: RedisClient) -> Application:
     app.add_handler(CommandHandler("agregar", cmd_agregar))
     app.add_handler(CommandHandler("lista", cmd_lista))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("status", cmd_status))
 
     logger.info(
-        "[BOT][INIT] handlers registrados: /start /agregar /lista /stop /status"
+        "[BOT][INIT] handlers registrados: /start /agregar /lista /stop /check /status"
     )
     return app
 

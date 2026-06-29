@@ -48,6 +48,18 @@ SCRAPERS: dict[str, type[BaseScraper]] = {
     "T4": T4Scraper,
 }
 
+# Lock en proceso para que un /check manual no se solape con el ciclo del
+# scheduler (ni dos ciclos manuales entre sí). Vive en el event loop principal,
+# compartido por el bot de Telegram y el scheduler. NO protege contra el
+# subprocess en sí (ese ya tiene su propio aislamiento), sino contra disparar
+# dos ciclos a la vez desde el proceso padre.
+_cycle_lock = asyncio.Lock()
+
+
+def is_cycle_running() -> bool:
+    """True si hay un ciclo (del scheduler o manual) en curso ahora mismo."""
+    return _cycle_lock.locked()
+
 
 def _load_items(redis_client: RedisClient) -> list[dict]:
     """Lee los items activos del hash ITEMS_KEY."""
@@ -334,7 +346,7 @@ def _spawn_and_wait_cycle() -> tuple[int | None, str]:
         return None, "timeout"
 
 
-async def run_check_cycle(redis_client: RedisClient) -> None:
+async def run_check_cycle(redis_client: RedisClient) -> bool:
     """Ejecuta un ciclo completo de chequeo en un SUBPROCESS con timeout duro.
 
     El ciclo (login + scraping con Playwright) corre en un proceso aparte
@@ -351,34 +363,52 @@ async def run_check_cycle(redis_client: RedisClient) -> None:
     los del proceso principal (Railway). Reconstruye sus propias conexiones a
     Redis y a Telegram desde el entorno, por lo que no necesita compartir
     objetos con el proceso padre.
+
+    Un `_cycle_lock` evita solapar este ciclo con otro ya en curso (p. ej. un
+    `/check` manual disparado mientras corre el del scheduler). Devuelve True si
+    el ciclo efectivamente corrió, o False si se salteó por haber otro en curso.
     """
-    rc, status = await asyncio.to_thread(_spawn_and_wait_cycle)
-
-    if status == "ok" and rc == 0:
-        logger.info("[WORKER][CYCLE] subprocess finalizó ok")
-        return
-
-    if status == "timeout":
-        _record_last_error(
-            redis_client,
-            "?",
-            "?",
-            f"ciclo cancelado por timeout global ({CYCLE_TIMEOUT_SECONDS}s) — "
-            f"subprocess terminado",
+    if _cycle_lock.locked():
+        logger.info(
+            "[WORKER][CYCLE] ya hay un ciclo en curso — se saltea este disparo"
         )
-    elif status == "spawn_error":
-        _record_last_error(redis_client, "?", "?", f"no pude lanzar el ciclo: {rc}")
-    else:
-        # status == "ok" pero rc != 0: el subprocess ya registró el error puntual
-        # en Redis; esto cubre crashes que no alcanzaron a hacerlo (segfault, OOM).
-        logger.error(f"[WORKER][CYCLE] subprocess terminó con código {rc}")
-        _record_last_error(
-            redis_client, "?", "?", f"subprocess de ciclo terminó con código {rc}"
-        )
+        return False
 
-    # El subprocess pudo no haber escrito worker:last_run; lo garantizamos acá
-    # para que /status no muestre una corrida vieja.
-    _safe_set_last_run(redis_client)
+    async with _cycle_lock:
+        rc, status = await asyncio.to_thread(_spawn_and_wait_cycle)
+
+        if status == "ok" and rc == 0:
+            logger.info("[WORKER][CYCLE] subprocess finalizó ok")
+        else:
+            if status == "timeout":
+                _record_last_error(
+                    redis_client,
+                    "?",
+                    "?",
+                    f"ciclo cancelado por timeout global ({CYCLE_TIMEOUT_SECONDS}s) — "
+                    f"subprocess terminado",
+                )
+            elif status == "spawn_error":
+                _record_last_error(
+                    redis_client, "?", "?", f"no pude lanzar el ciclo: {rc}"
+                )
+            else:
+                # status == "ok" pero rc != 0: el subprocess ya registró el error
+                # puntual en Redis; esto cubre crashes que no alcanzaron a hacerlo
+                # (segfault, OOM).
+                logger.error(f"[WORKER][CYCLE] subprocess terminó con código {rc}")
+                _record_last_error(
+                    redis_client,
+                    "?",
+                    "?",
+                    f"subprocess de ciclo terminó con código {rc}",
+                )
+
+            # El subprocess pudo no haber escrito worker:last_run; lo garantizamos
+            # acá para que /status no muestre una corrida vieja.
+            _safe_set_last_run(redis_client)
+
+    return True
 
 
 def _configure_subprocess_logger() -> None:
