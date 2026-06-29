@@ -3,12 +3,13 @@
 Bot de monitoreo de turnos en terminales portuarias argentinas.
 Detecta automáticamente la apertura de turnos para retiro/entrega de contenedores en T4/APM Terminals, TRP y Exolgan, y notifica al operador vía Telegram.
 
-## Estado actual (29/05/2026)
+## Estado actual (29/06/2026)
 
-- ✅ **Deploy funcionando en Railway** (Dockerfile-based, deployment `708770bb`)
+- ✅ **Deploy funcionando en Railway** (Dockerfile-based)
+- ✅ **Fix Chrome SIGTRAP** — el Dockerfile usaba una lista manual de libs incompleta para el `chrome-headless-shell` de Playwright 1.59; crasheaba al lanzarse (`SIGTRAP` / `TargetClosedError`) en cada ciclo → 0 items chequeados. Reemplazado por `playwright install --with-deps chromium`. Verificado en prod: ciclo chequea items y envía alertas.
 - ✅ **Scraper T4 funcionando** — login, búsqueda por booking, extracción de turnos del calendario, alertas enviadas
 - ✅ **Bot Telegram operativo** — `/agregar`, `/lista`, `/stop`, `/status` respondiendo
-- ✅ **Alertas funcionando** — primer alerta real enviada: BUA0367004 / TLLU2006489, 46 turnos 01/06 y 71 turnos 02/06
+- ✅ **Alertas funcionando** — última verificada: HASU1545151, 137 turnos 30/06
 - 🔲 Scraper TRP — skeleton, pendiente de implementar
 - 🔲 Scraper Exolgan — skeleton, pendiente de implementar
 - 🔲 Comando `/check` para forzar ciclo inmediato desde Telegram
@@ -34,7 +35,7 @@ Detecta automáticamente la apertura de turnos para retiro/entrega de contenedor
 
 ```
 terminal-monitor/
-├── Dockerfile               # python:3.11-slim + libs sistema + playwright chromium
+├── Dockerfile               # python:3.11-slim + playwright install --with-deps chromium
 ├── railway.json             # builder: DOCKERFILE
 ├── .env                     # credenciales reales (gitignored)
 ├── .env.example
