@@ -8,11 +8,11 @@ Detecta automáticamente la apertura de turnos para retiro/entrega de contenedor
 - ✅ **Deploy funcionando en Railway** (Dockerfile-based)
 - ✅ **Fix Chrome SIGTRAP** — el Dockerfile usaba una lista manual de libs incompleta para el `chrome-headless-shell` de Playwright 1.59; crasheaba al lanzarse (`SIGTRAP` / `TargetClosedError`) en cada ciclo → 0 items chequeados. Reemplazado por `playwright install --with-deps chromium`. Verificado en prod: ciclo chequea items y envía alertas.
 - ✅ **Scraper T4 funcionando** — login, búsqueda por booking, extracción de turnos del calendario, alertas enviadas
-- ✅ **Bot Telegram operativo** — `/agregar`, `/lista`, `/stop`, `/status` respondiendo
+- ✅ **Bot Telegram operativo** — `/agregar`, `/lista`, `/stop`, `/check`, `/status` respondiendo
+- ✅ **Comando `/check`** — fuerza un ciclo inmediato sin esperar al scheduler; ackea al toque y reporta el resultado en una task de fondo. `_cycle_lock` evita que se solape con el ciclo del scheduler.
 - ✅ **Alertas funcionando** — última verificada: HASU1545151, 137 turnos 30/06
 - 🔲 Scraper TRP — skeleton, pendiente de implementar
 - 🔲 Scraper Exolgan — skeleton, pendiente de implementar
-- 🔲 Comando `/check` para forzar ciclo inmediato desde Telegram
 
 ## Stack
 
@@ -106,8 +106,7 @@ python tests/test_t4_manual.py > tests\logs\test_output.txt 2>&1
 
 ## Próximos pasos
 
-1. Comando `/check` — forzar ciclo inmediato desde Telegram
-2. Activar auto-deploy en Railway (Settings → Source → conectar GitHub)
-3. Scraper TRP — login usuario/contraseña, identificador = N° contenedor
-4. Scraper Exolgan — flujo 7 pasos, detener ANTES del click de reserva
-5. Fix encoding screenshot (`\u2192` → charmap en Windows)
+1. Activar auto-deploy en Railway (Settings → Source → conectar GitHub)
+2. Scraper TRP — login usuario/contraseña, identificador = N° contenedor
+3. Scraper Exolgan — flujo 7 pasos, detener ANTES del click de reserva
+4. Fix encoding screenshot (`\u2192` → charmap en Windows)
